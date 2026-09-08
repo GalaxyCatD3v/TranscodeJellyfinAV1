@@ -13,27 +13,53 @@ from av1_migrator.logger import get_logger
 from av1_migrator.models import StorageStats
 
 
-def get_path_disk_usage(path: str | Path) -> StorageStats:
+def get_path_disk_usage(
+    path: str | Path,
+    fallback_stats: Optional[StorageStats] = None,
+) -> StorageStats:
     """
-    Get disk usage for the given path.
-    Finds the closest existing parent if the path itself does not exist yet.
+    Get disk usage for the given path with robust error tolerance for SSHFS/network mounts.
+    Queries the volume/anchor root to avoid expensive, failing stat calls on deep remote files.
     """
-    p = Path(path).resolve()
-    while not p.exists() and p.parent != p:
-        p = p.parent
+    logger = get_logger()
+    try:
+        p = Path(path)
+        # On Windows / UNC, use anchor (e.g. 'Y:\\' or '\\\\server\\share\\') to query volume directly
+        if p.anchor and (p.drive or str(path).startswith("\\\\")):
+            target = p.anchor
+        else:
+            # On POSIX or relative paths, use parent if path looks like a file
+            target = str(p.parent) if p.suffix else str(p)
+    except Exception:
+        target = str(path)
 
     try:
-        total, used, free = shutil.disk_usage(str(p))
-    except Exception as e:
-        get_logger().warning(f"Could not get disk usage for {p}: {e}")
-        # Return fallback zeros
-        total, used, free = 0, 0, 0
+        total, used, free = shutil.disk_usage(target)
+        return StorageStats(
+            free_bytes=free,
+            total_bytes=total,
+            used_bytes=used,
+        )
+    except (OSError, PermissionError, ValueError) as e:
+        # Fallback attempt with anchor if different
+        try:
+            anchor = Path(path).anchor
+            if anchor and anchor != target:
+                total, used, free = shutil.disk_usage(anchor)
+                return StorageStats(
+                    free_bytes=free,
+                    total_bytes=total,
+                    used_bytes=used,
+                )
+        except Exception:
+            pass
 
-    return StorageStats(
-        free_bytes=free,
-        total_bytes=total,
-        used_bytes=used,
-    )
+        # If fallback_stats provided and valid, return that
+        if fallback_stats is not None and fallback_stats.total_bytes > 0:
+            return fallback_stats
+
+        logger.debug(f"Could not get disk usage for {path} (target: {target}): {e}")
+        return StorageStats(free_bytes=0, total_bytes=0, used_bytes=0)
 
 
 def check_storage_safety(
@@ -73,6 +99,7 @@ class StorageMonitorThread:
     """
     Independent background monitor thread that checks free space every poll_interval seconds.
     If free space falls below minimum_free_space_bytes, immediately invokes on_emergency_stop callback.
+    Resilient against transient SSHFS / network I/O errors (e.g. WinError 1450).
     """
 
     def __init__(
@@ -86,15 +113,27 @@ class StorageMonitorThread:
         self.minimum_free_space_bytes = minimum_free_space_bytes
         self.poll_interval = poll_interval
         self.on_emergency_stop = on_emergency_stop
-        
+
+        # Determine target path once for efficiency
+        try:
+            p = Path(watch_path)
+            if p.anchor and (p.drive or str(watch_path).startswith("\\\\")):
+                self._disk_target = p.anchor
+            else:
+                self._disk_target = str(p.parent) if p.suffix else str(p)
+        except Exception:
+            self._disk_target = str(watch_path)
+
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self.last_stats = StorageStats()
         self.is_emergency_triggered = False
+        self._consecutive_errors = 0
 
     def start(self) -> None:
         self._stop_event.clear()
         self.is_emergency_triggered = False
+        self._consecutive_errors = 0
         self._thread = threading.Thread(target=self._run, name="StorageMonitor", daemon=True)
         self._thread.start()
 
@@ -108,20 +147,27 @@ class StorageMonitorThread:
         logger = get_logger()
         while not self._stop_event.is_set():
             try:
-                stats = get_path_disk_usage(self.watch_path)
+                stats = get_path_disk_usage(self._disk_target, fallback_stats=self.last_stats)
                 stats.minimum_free_bytes = self.minimum_free_space_bytes
-                self.last_stats = stats
 
-                if stats.total_bytes > 0 and stats.free_bytes < self.minimum_free_space_bytes:
-                    self.is_emergency_triggered = True
-                    logger.critical(
-                        f"!!! STORAGE SAFETY STOP TRIGGERED !!! "
-                        f"Free space: {format_bytes(stats.free_bytes)} < Minimum: {format_bytes(self.minimum_free_space_bytes)}"
-                    )
-                    if self.on_emergency_stop:
-                        self.on_emergency_stop(stats)
-                    break
+                if stats.total_bytes > 0:
+                    self.last_stats = stats
+                    self._consecutive_errors = 0
+
+                    if stats.free_bytes < self.minimum_free_space_bytes:
+                        self.is_emergency_triggered = True
+                        logger.critical(
+                            f"!!! STORAGE SAFETY STOP TRIGGERED !!! "
+                            f"Free space: {format_bytes(stats.free_bytes)} < Minimum: {format_bytes(self.minimum_free_space_bytes)}"
+                        )
+                        if self.on_emergency_stop:
+                            self.on_emergency_stop(stats)
+                        break
             except Exception as e:
-                logger.error(f"Error in StorageMonitorThread: {e}")
+                self._consecutive_errors += 1
+                if self._consecutive_errors in (5, 20, 60):
+                    logger.warning(f"Storage monitor transient error ({e}) for {self._disk_target}")
+                else:
+                    logger.debug(f"Storage monitor error: {e}")
 
             time.sleep(self.poll_interval)

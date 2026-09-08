@@ -47,3 +47,44 @@ def test_storage_safety_insufficient():
         )
         assert is_safe is False
         assert "failed" in msg.lower()
+
+
+def test_get_path_disk_usage_winerror_1450_recovery():
+    """Verify that get_path_disk_usage recovers from WinError 1450 using fallback stats."""
+    from av1_migrator.storage import get_path_disk_usage
+
+    fallback = StorageStats(
+        free_bytes=1000,
+        total_bytes=2000,
+        used_bytes=1000,
+    )
+
+    with patch("shutil.disk_usage", side_effect=OSError(1450, "Insufficient system resources")):
+        stats = get_path_disk_usage(
+            "Y:\\srv\\storage\\Movies\\Movie (2020)\\Movie.mkv",
+            fallback_stats=fallback,
+        )
+        assert stats.free_bytes == 1000
+        assert stats.total_bytes == 2000
+
+
+def test_storage_monitor_thread_winerror_1450_resilience():
+    """Verify that StorageMonitorThread handles transient WinError 1450 without aborting."""
+    from av1_migrator.storage import StorageMonitorThread
+    import time
+
+    emergency_called = []
+    monitor = StorageMonitorThread(
+        watch_path="Y:\\srv\\storage\\Movies\\Movie (2020)\\Movie.mkv",
+        minimum_free_space_bytes=100,
+        poll_interval=0.05,
+        on_emergency_stop=lambda s: emergency_called.append(s),
+    )
+
+    with patch("shutil.disk_usage", side_effect=OSError(1450, "Insufficient system resources")):
+        monitor.start()
+        time.sleep(0.15)
+        monitor.stop()
+
+    assert len(emergency_called) == 0
+    assert monitor.is_emergency_triggered is False
