@@ -1,0 +1,78 @@
+# Galaxy AV1 Migrator - Configuration File
+# Safely converts Jellyfin media library over SSHFS to AV1 1080p using NVIDIA NVENC.
+
+media_roots:
+  - "Y:\\srv\\storage\\Movies"
+  - "Y:\\media\\TVShows"
+
+extensions:
+  - ".mkv"
+  - ".mp4"
+  - ".m4v"
+  - ".m2ts"
+  - ".ts"
+  - ".avi"
+  - ".mov"
+
+output:
+  container: "mkv"
+  video_codec: "av1_nvenc"
+  preset: "p5"
+  cq: 28
+  width: 1920
+  height: 1080
+  prefer_cuda_scale: true
+  pixel_format: "p010le"
+
+audio:
+  languages:
+    - "eng"
+    - "en"
+    - "english"
+  mode: "copy"
+  bitrate: "256k"
+  exclude_commentary: true
+
+subtitles:
+  languages:
+    - "eng"
+    - "en"
+    - "english"
+  mode: "copy"
+
+storage:
+  minimum_free_space: "1TB"
+  safety_margin: "10GB"
+  poll_interval: 0.5
+
+processing:
+  sort: "largest_first"
+  delete_original: true
+  validate_output: true
+  keep_smaller: true
+  pre_encode_check: true          # Pre-encode sample analysis to predict space savings & prevent wasted encoding
+  sample_duration: 30.0           # Seconds of representative sample clip to test transcode
+  min_savings_percent: 0.0        # Minimum % savings required to transcode (0.0 = must not bloat)
+  resume: true
+  network_retries: 3
+  network_retry_delay: 30.0
+  duration_tolerance: 2.0
+
+video_selection:
+  prefer_native_1080p: false
+
+ffmpeg:
+  executable: "ffmpeg.exe"
+  ffprobe: "ffprobe.exe"
+
+ui:
+  refresh_rate: 1.0
+
+database:
+  path: "migration.db"
+
+logging:
+  directory: "logs"
+  filename: "av1-migrator.log"
+  max_bytes: 10485760 # 10 MB
+  backup_count: 5
