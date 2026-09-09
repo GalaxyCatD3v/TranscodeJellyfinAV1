@@ -95,7 +95,7 @@ def run_interpolation_benchmark(
         if is_synthetic:
             vf_filter = f"format=yuv420p,hwupload_cuda,scale_cuda={target_w}:{target_h}:interp_algo={algo}:format=p010le"
         else:
-            vf_filter = f"hwupload_cuda,scale_cuda={target_w}:{target_h}:interp_algo={algo}"
+            vf_filter = f"hwupload_cuda,scale_cuda={target_w}:{target_h}:interp_algo={algo}:format={pix_fmt}"
 
         cmd = [
             exe,

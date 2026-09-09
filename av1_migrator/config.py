@@ -133,6 +133,7 @@ class ProcessingConfig:
     sample_duration: float = 30.0  # Duration in seconds of sample clip for space optimization test
     min_savings_percent: float = 0.0  # Minimum % space savings required to proceed (0.0 = must not bloat)
     enable_gpu_encoding: bool = True
+    gpu_workers: int = 2  # Number of concurrent GPU workers (default: 2 to saturate dual NVENC engines)
     enable_cpu_encoding: bool = True
     cpu_max_file_size: Optional[str] = None
     resume: bool = True
@@ -264,6 +265,7 @@ def load_config(config_path: Optional[str | Path] = None) -> AppConfig:
                 sample_duration=float(pr_data.get("sample_duration", config.processing.sample_duration)),
                 min_savings_percent=float(pr_data.get("min_savings_percent", config.processing.min_savings_percent)),
                 enable_gpu_encoding=bool(pr_data.get("enable_gpu_encoding", config.processing.enable_gpu_encoding)),
+                gpu_workers=int(pr_data.get("gpu_workers", config.processing.gpu_workers)),
                 enable_cpu_encoding=bool(pr_data.get("enable_cpu_encoding", config.processing.enable_cpu_encoding)),
                 cpu_max_file_size=pr_data.get("cpu_max_file_size", config.processing.cpu_max_file_size),
                 resume=bool(pr_data.get("resume", config.processing.resume)),

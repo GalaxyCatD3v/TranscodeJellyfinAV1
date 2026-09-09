@@ -115,6 +115,12 @@ def parse_args() -> argparse.Namespace:
         help="Disable GPU encoding worker",
     )
     parser.add_argument(
+        "--gpu-workers",
+        type=int,
+        default=None,
+        help="Number of concurrent GPU NVENC workers (default: 2)",
+    )
+    parser.add_argument(
         "--staging-dir",
         type=str,
         default=None,
@@ -170,6 +176,8 @@ def main() -> int:
         config.processing.enable_cpu_encoding = False
     if args.no_gpu:
         config.processing.enable_gpu_encoding = False
+    if args.gpu_workers is not None:
+        config.processing.gpu_workers = max(1, args.gpu_workers)
     if args.staging_dir:
         config.storage.local_staging_dir = args.staging_dir
     if args.no_staging:

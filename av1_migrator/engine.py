@@ -142,8 +142,9 @@ class MigrationEngine:
             checks.append("⚠ NVIDIA GPU (nvidia-smi not found in PATH)")
 
         # AV1 NVENC
+        gpu_workers_cnt = getattr(self.config.processing, "gpu_workers", 2)
         if is_av1_nvenc_available(self.config.ffmpeg.executable):
-            checks.append("✓ AV1 NVENC encoder available")
+            checks.append(f"✓ AV1 NVENC encoder available (GPU Workers: {gpu_workers_cnt})")
         else:
             checks.append("⚠ AV1 NVENC encoder not found in FFmpeg (GPU encoding disabled)")
 
@@ -283,7 +284,7 @@ class MigrationEngine:
             if stg_dir.exists():
                 try:
                     for f in stg_dir.iterdir():
-                        if f.is_file() and (f.name.startswith("gpu_") or f.name.startswith("cpu_") or ".encoding.mkv" in f.name):
+                        if f.is_file() and (f.name.startswith("gpu") or f.name.startswith("cpu") or ".encoding.mkv" in f.name):
                             try:
                                 f.unlink(missing_ok=True)
                                 self.logger.info(f"Startup recovery: cleaned leftover local staging file {f}")
@@ -649,9 +650,10 @@ class MigrationEngine:
                 if local_free >= required_local:
                     stem_clean = sanitize_filename(media_file.source.stem)
                     ext_clean = media_file.source.suffix
-                    staged_source = staging_dir / f"{worker_type.lower()}_{stem_clean}{ext_clean}"
+                    worker_tag = sanitize_filename(worker_type.lower().replace(" ", "_"))
+                    staged_source = staging_dir / f"{worker_tag}_{stem_clean}{ext_clean}"
                     hdr_tag = "HDR10" if media_file.hdr else "SDR"
-                    staged_output = staging_dir / f"{worker_type.lower()}_{stem_clean} [AV1 1080p {hdr_tag} CQ28].mkv.encoding.mkv"
+                    staged_output = staging_dir / f"{worker_tag}_{stem_clean} [AV1 1080p {hdr_tag} CQ28].mkv.encoding.mkv"
 
                     worker_pbar.set_description(f"{worker_type} [{media_file.source.name[:25]}]: Staging locally...")
                     worker_pbar.set_postfix_str(f"Copying {format_bytes(media_file.size)} to {staging_dir.drive or staging_dir}...")
@@ -692,7 +694,7 @@ class MigrationEngine:
                 f"{p.speed:.2f}x ({p.fps:.1f} fps)",
                 f"ETA {eta_val}",
             ]
-            if worker_type == "GPU":
+            if worker_type.startswith("GPU"):
                 gpu_str = self.get_gpu_status_str()
                 if gpu_str:
                     parts.append(gpu_str)
@@ -704,12 +706,13 @@ class MigrationEngine:
                 pass
 
         # 6. Instantiate and run encoder (with graceful fallback for custom test mocks)
+        enc_type = "cpu" if worker_type.startswith("CPU") else "gpu"
         try:
             encoder = FFmpegEncoder(
                 media_file=media_file,
                 config=self.config,
                 on_progress=on_progress,
-                encoder_type=worker_type.lower(),
+                encoder_type=enc_type,
                 input_path=active_input,
                 output_path=active_output,
             )
@@ -918,7 +921,7 @@ class MigrationEngine:
                 if not self.queue:
                     break
 
-                if worker_type == "CPU":
+                if worker_type.startswith("CPU"):
                     # CPU worker prioritizes smaller files to prevent getting bogged down on 80GB Remuxes
                     # while GPU handles the large files
                     if len(self.queue) > 1 and self.config.processing.enable_gpu_encoding:
@@ -1010,45 +1013,51 @@ class MigrationEngine:
         # 4. Start GPU telemetry
         self.gpu_monitor.start()
 
-        # 5. Initialize 3-line tqdm progress bars
+        # 5. Initialize dynamic multi-line tqdm progress bars
         # Position 0: Overall Library
-        # Position 1: CPU Worker
-        # Position 2: GPU Worker
+        # Position 1..N: GPU Worker(s)
+        # Position N+1: CPU Worker (if enabled)
         overall_prog = create_overall_progressbar(len(queue), message="Overall Migration", position=0)
         overall_prog.start()
         self._overall_pbar = overall_prog
 
-        cpu_prog = create_worker_progressbar("CPU", position=1)
-        cpu_prog.start()
-
-        gpu_prog = create_worker_progressbar("GPU", position=2)
-        gpu_prog.start()
-
-        # Determine worker activation
         gpu_active = self.config.processing.enable_gpu_encoding and is_av1_nvenc_available(self.config.ffmpeg.executable)
         cpu_active = self.config.processing.enable_cpu_encoding
+        num_gpu_workers = max(1, getattr(self.config.processing, "gpu_workers", 2)) if gpu_active else 0
 
-        if not gpu_active:
+        pbars: List[MigrationProgressBar] = []
+        threads: List[threading.Thread] = []
+        cur_pos = 1
+
+        if num_gpu_workers > 0:
+            for g_idx in range(1, num_gpu_workers + 1):
+                w_name = f"GPU {g_idx}" if num_gpu_workers > 1 else "GPU"
+                g_pbar = create_worker_progressbar(w_name, position=cur_pos)
+                g_pbar.start()
+                pbars.append(g_pbar)
+                cur_pos += 1
+
+                t_gpu = threading.Thread(
+                    target=self._worker_loop,
+                    args=(w_name, g_pbar),
+                    name=f"{w_name.replace(' ', '-')}-Worker",
+                    daemon=True,
+                )
+                threads.append(t_gpu)
+        else:
+            gpu_prog = create_worker_progressbar("GPU", position=cur_pos)
+            gpu_prog.start()
             gpu_prog.set_description("GPU [Disabled / NVENC unavailable]")
             gpu_prog.set_postfix_str("Idle")
-        if not cpu_active:
-            cpu_prog.set_description("CPU [Disabled in config]")
-            cpu_prog.set_postfix_str("Idle")
-
-        # 6. Spawn worker threads
-        threads: List[threading.Thread] = []
-
-        if gpu_active:
-            t_gpu = threading.Thread(
-                target=self._worker_loop,
-                args=("GPU", gpu_prog),
-                name="GPU-Worker",
-                daemon=True,
-            )
-            threads.append(t_gpu)
-            t_gpu.start()
+            pbars.append(gpu_prog)
+            cur_pos += 1
 
         if cpu_active:
+            cpu_prog = create_worker_progressbar("CPU", position=cur_pos)
+            cpu_prog.start()
+            pbars.append(cpu_prog)
+            cur_pos += 1
+
             t_cpu = threading.Thread(
                 target=self._worker_loop,
                 args=("CPU", cpu_prog),
@@ -1056,18 +1065,27 @@ class MigrationEngine:
                 daemon=True,
             )
             threads.append(t_cpu)
-            t_cpu.start()
+        else:
+            cpu_prog = create_worker_progressbar("CPU", position=cur_pos)
+            cpu_prog.start()
+            cpu_prog.set_description("CPU [Disabled in config]")
+            cpu_prog.set_postfix_str("Idle")
+            pbars.append(cpu_prog)
+            cur_pos += 1
 
         # If neither worker active, fallback to GPU
         if not threads:
+            fallback_pbar = pbars[0] if pbars else create_worker_progressbar("GPU", position=1)
             t_fallback = threading.Thread(
                 target=self._worker_loop,
-                args=("GPU", gpu_prog),
+                args=("GPU", fallback_pbar),
                 name="Fallback-Worker",
                 daemon=True,
             )
             threads.append(t_fallback)
-            t_fallback.start()
+
+        for t in threads:
+            t.start()
 
         try:
             for t in threads:
@@ -1077,14 +1095,11 @@ class MigrationEngine:
                 overall_prog.finish()
             except Exception:
                 pass
-            try:
-                cpu_prog.finish()
-            except Exception:
-                pass
-            try:
-                gpu_prog.finish()
-            except Exception:
-                pass
+            for pb in pbars:
+                try:
+                    pb.finish()
+                except Exception:
+                    pass
             self.gpu_monitor.stop()
 
         # Final Summary

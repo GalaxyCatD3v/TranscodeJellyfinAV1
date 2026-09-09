@@ -61,6 +61,7 @@ processing:
   sample_duration: 30.0           # Seconds of representative sample clip to test transcode
   min_savings_percent: 0.0        # Minimum % savings required to transcode (0.0 = must not bloat)
   enable_gpu_encoding: true       # Use NVIDIA RTX 4070 Ti NVENC worker
+  gpu_workers: 2                  # Number of concurrent GPU workers to fully saturate dual NVENC engines
   enable_cpu_encoding: true       # Use concurrent CPU AV1 worker alongside GPU
   resume: true
   network_retries: 3
