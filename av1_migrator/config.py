@@ -106,7 +106,7 @@ class StorageConfig:
     minimum_free_space: str = "1TB"
     safety_margin: str = "10GB"
     poll_interval: float = 0.5
-    local_staging_dir: str = "Z:\\JellyfinTranscode"
+    local_staging_dir: str = "F:\\JellyfinTranscode"
     enable_local_staging: bool = True
     local_min_free_space: str = "20GB"
 

@@ -48,7 +48,7 @@ storage:
   minimum_free_space: "1TB"
   safety_margin: "10GB"
   poll_interval: 0.5
-  local_staging_dir: "Z:\\JellyfinTranscode"  # Local fast NVMe directory for zero-latency encoding
+  local_staging_dir: "F:\\JellyfinTranscode"  # Local fast NVMe directory for zero-latency encoding
   enable_local_staging: true                 # Stage remote files locally to eliminate GPU starvation
   local_min_free_space: "20GB"
 

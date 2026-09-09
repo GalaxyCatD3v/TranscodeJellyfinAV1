@@ -124,7 +124,7 @@ def parse_args() -> argparse.Namespace:
         "--staging-dir",
         type=str,
         default=None,
-        help="Path to local fast NVMe staging directory (default: Z:\\JellyfinTranscode)",
+        help="Path to local fast NVMe staging directory (default: F:\\JellyfinTranscode)",
     )
     parser.add_argument(
         "--no-staging",

@@ -159,7 +159,7 @@ class MigrationEngine:
         cpu_codec = get_available_cpu_av1_encoder(self.config.ffmpeg.executable)
         checks.append(f"✓ CPU AV1 encoder available ({cpu_codec})")
 
-        # Local Staging Directory (e.g. Z:\JellyfinTranscode)
+        # Local Staging Directory (e.g. F:\JellyfinTranscode)
         if self.config.storage.enable_local_staging:
             stg_dir = Path(self.config.storage.local_staging_dir)
             try:
@@ -253,7 +253,7 @@ class MigrationEngine:
         """
         Inspects database for any tasks that were previously interrupted (status in encoding/validating).
         Cleans up stale temporary files and resets items to pending so they retry cleanly.
-        Also cleans leftover files in local staging directory (Z:/JellyfinTranscode).
+        Also cleans leftover files in local staging directory (F:/JellyfinTranscode).
         """
         self.logger.info("Checking database for uncompleted/interrupted migration tasks from previous runs...")
 
@@ -588,7 +588,7 @@ class MigrationEngine:
     ) -> None:
         """
         Processes a single media file end-to-end for a given worker (GPU or CPU):
-        Pre-encode check -> Local staging (Z:/JellyfinTranscode) -> Encoding ->
+        Pre-encode check -> Local staging (F:/JellyfinTranscode) -> Encoding ->
         Validation -> Bloat rejection -> Promotion -> Cleanup.
         """
         with self.lock:
