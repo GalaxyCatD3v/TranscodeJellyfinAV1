@@ -70,13 +70,14 @@ def build_sample_ffmpeg_command(
         for s in media_file.selected_subtitles:
             cmd.extend(["-map", f"0:{s.index}"])
 
-    # Video Filter: CUDA vs Software Lanczos
+    # Video Filter: CUDA vs Software Scaling
     target_w = config.output.width
     target_h = config.output.height
+    interp = getattr(config.output, "cuda_interp_algo", "bicubic")
     if use_cuda_scale:
-        vf_filter = f"hwupload_cuda,scale_cuda={target_w}:{target_h}:interp_algo=lanczos"
+        vf_filter = f"hwupload_cuda,scale_cuda={target_w}:{target_h}:interp_algo={interp}"
     else:
-        vf_filter = f"scale={target_w}:{target_h}:flags=lanczos"
+        vf_filter = f"scale={target_w}:{target_h}:flags={interp}"
 
     cmd.extend(["-vf", vf_filter])
 

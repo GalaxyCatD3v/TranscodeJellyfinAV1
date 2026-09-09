@@ -68,22 +68,72 @@ def is_scale_cuda_available(ffmpeg_path: str = "ffmpeg.exe") -> bool:
         return False
 
 
+def is_libsvtav1_available(ffmpeg_path: str = "ffmpeg.exe") -> bool:
+    """Checks if libsvtav1 CPU encoder is compiled into ffmpeg."""
+    exe = find_binary_executable(ffmpeg_path) or ffmpeg_path
+    try:
+        proc = subprocess.run(
+            [exe, "-hide_banner", "-encoders"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5.0,
+            check=False,
+        )
+        return "libsvtav1" in proc.stdout
+    except Exception:
+        return False
+
+
+def is_libaom_available(ffmpeg_path: str = "ffmpeg.exe") -> bool:
+    """Checks if libaom-av1 CPU encoder is compiled into ffmpeg."""
+    exe = find_binary_executable(ffmpeg_path) or ffmpeg_path
+    try:
+        proc = subprocess.run(
+            [exe, "-hide_banner", "-encoders"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5.0,
+            check=False,
+        )
+        return "libaom-av1" in proc.stdout
+    except Exception:
+        return False
+
+
+def get_available_cpu_av1_encoder(ffmpeg_path: str = "ffmpeg.exe") -> str:
+    """Returns the best available CPU AV1 encoder ('libsvtav1' preferred, fallback 'libaom-av1')."""
+    if is_libsvtav1_available(ffmpeg_path):
+        return "libsvtav1"
+    return "libaom-av1"
+
+
 def build_ffmpeg_command(
     media_file: MediaFile,
     config: AppConfig,
     use_cuda_scale: bool = True,
+    encoder_type: str = "gpu",
+    interp_algo: Optional[str] = None,
+    input_path: Optional[Path] = None,
+    output_path: Optional[Path] = None,
 ) -> List[str]:
     """
     Constructs the list of arguments for FFmpeg.
+    Supports GPU (av1_nvenc) and CPU (libsvtav1 / libaom-av1) encoding, configurable interpolation
+    algorithms (bicubic, bilinear, lanczos), and custom input/output staging paths.
     NEVER use shell=True. Filenames and paths are passed verbatim as list elements.
     """
     exe = find_binary_executable(config.ffmpeg.executable) or config.ffmpeg.executable
+    src = str(input_path or media_file.source)
     cmd = [
         exe,
         "-y",
         "-nostdin",
         "-hide_banner",
-        "-i", str(media_file.source),
+        "-i", src,
     ]
 
     # Map Video
@@ -104,24 +154,56 @@ def build_ffmpeg_command(
         for s in media_file.selected_subtitles:
             cmd.extend(["-map", f"0:{s.index}"])
 
-    # Video Filter: CUDA vs Software Lanczos
+    # Video Filter & Codec settings
     target_w = config.output.width
     target_h = config.output.height
-    
-    if use_cuda_scale:
-        vf_filter = f"hwupload_cuda,scale_cuda={target_w}:{target_h}:interp_algo=lanczos"
+    interp = interp_algo or getattr(config.output, "cuda_interp_algo", "bicubic")
+    enc_type = encoder_type.lower()
+
+    if enc_type == "cpu":
+        # CPU AV1 Encoding
+        vf_filter = f"scale={target_w}:{target_h}:flags={interp}"
+        cmd.extend(["-vf", vf_filter])
+
+        cpu_codec = getattr(config.output, "cpu_video_codec", "auto")
+        if cpu_codec == "auto":
+            cpu_codec = get_available_cpu_av1_encoder(config.ffmpeg.executable)
+
+        cmd.extend(["-c:v", cpu_codec])
+        cpu_preset = getattr(config.output, "cpu_preset", "6")
+        cpu_crf = getattr(config.output, "cpu_crf", 28)
+
+        if cpu_codec == "libsvtav1":
+            cmd.extend([
+                "-preset", str(cpu_preset),
+                "-crf", str(cpu_crf),
+                "-pix_fmt", "yuv420p10le",
+            ])
+        elif cpu_codec == "libaom-av1":
+            cmd.extend([
+                "-cpu-used", str(cpu_preset),
+                "-crf", str(cpu_crf),
+                "-pix_fmt", "yuv420p10le",
+            ])
+        else:
+            cmd.extend([
+                "-crf", str(cpu_crf),
+                "-pix_fmt", "yuv420p10le",
+            ])
     else:
-        vf_filter = f"scale={target_w}:{target_h}:flags=lanczos"
+        # GPU Encoding (av1_nvenc)
+        if use_cuda_scale:
+            vf_filter = f"hwupload_cuda,scale_cuda={target_w}:{target_h}:interp_algo={interp}"
+        else:
+            vf_filter = f"scale={target_w}:{target_h}:flags={interp}"
+        cmd.extend(["-vf", vf_filter])
 
-    cmd.extend(["-vf", vf_filter])
-
-    # Video Codec settings
-    cmd.extend([
-        "-c:v", config.output.video_codec,
-        "-preset", config.output.preset,
-        "-cq", str(config.output.cq),
-        "-pix_fmt", config.output.pixel_format,
-    ])
+        cmd.extend([
+            "-c:v", config.output.video_codec,
+            "-preset", config.output.preset,
+            "-cq", str(config.output.cq),
+            "-pix_fmt", config.output.pixel_format,
+        ])
 
     # Color metadata
     if media_file.hdr:
@@ -159,8 +241,8 @@ def build_ffmpeg_command(
     ])
 
     # Temporary output target
-    temp_target = media_file.temp_output_path or (media_file.source.parent / f"{media_file.source.stem}.encoding.mkv")
-    cmd.append(str(temp_target))
+    dst = output_path or media_file.temp_output_path or (media_file.source.parent / f"{media_file.source.stem}.encoding.mkv")
+    cmd.append(str(dst))
 
     return cmd
 
@@ -181,17 +263,24 @@ def parse_out_time_to_seconds(time_str: str) -> float:
 
 class FFmpegEncoder:
     """
-    Manages the lifecycle of an FFmpeg encoding job.
+    Manages the lifecycle of an FFmpeg encoding job (GPU av1_nvenc or CPU AV1).
     """
     def __init__(
         self,
         media_file: MediaFile,
         config: AppConfig,
         on_progress: Optional[Callable[[EncodeProgress], None]] = None,
+        encoder_type: str = "gpu",
+        input_path: Optional[Path] = None,
+        output_path: Optional[Path] = None,
+        **kwargs: Any,
     ):
         self.media_file = media_file
         self.config = config
         self.on_progress = on_progress
+        self.encoder_type = encoder_type.lower()
+        self.input_path = Path(input_path) if input_path else media_file.source
+        self.output_path = Path(output_path) if output_path else media_file.temp_output_path
 
         self.process: Optional[subprocess.Popen] = None
         self.progress = EncodeProgress()
@@ -202,10 +291,11 @@ class FFmpegEncoder:
 
     def run(self) -> Tuple[bool, str]:
         """
-        Executes FFmpeg. First tries CUDA scaling (if enabled/available), falls back to software scale if needed.
+        Executes FFmpeg. For GPU, first tries CUDA scaling, falling back to software scale if needed.
+        For CPU, executes directly with CPU AV1 encoder.
         """
         logger = get_logger()
-        temp_file = self.media_file.temp_output_path
+        temp_file = self.output_path
         if not temp_file:
             return False, "No temporary output path specified"
 
@@ -217,28 +307,55 @@ class FFmpegEncoder:
             except Exception as e:
                 logger.warning(f"Failed to remove stale temporary file {temp_file}: {e}")
 
-        # Check CUDA scaling capability
-        use_cuda = self.config.output.prefer_cuda_scale and is_scale_cuda_available(self.config.ffmpeg.executable)
+        if self.encoder_type == "cpu":
+            cmd = build_ffmpeg_command(
+                self.media_file,
+                self.config,
+                use_cuda_scale=False,
+                encoder_type="cpu",
+                input_path=self.input_path,
+                output_path=self.output_path,
+            )
+            logger.info(f"Starting CPU FFmpeg encode for {self.media_file.source.name}")
+            logger.debug(f"FFmpeg command: {' '.join(cmd)}")
+            success, msg = self._execute_process(cmd)
+        else:
+            # Check CUDA scaling capability
+            use_cuda = self.config.output.prefer_cuda_scale and is_scale_cuda_available(self.config.ffmpeg.executable)
 
-        cmd = build_ffmpeg_command(self.media_file, self.config, use_cuda_scale=use_cuda)
-        logger.info(f"Starting FFmpeg encode for {self.media_file.source.name} (CUDA scale: {use_cuda})")
-        logger.debug(f"FFmpeg command: {' '.join(cmd)}")
+            cmd = build_ffmpeg_command(
+                self.media_file,
+                self.config,
+                use_cuda_scale=use_cuda,
+                encoder_type="gpu",
+                input_path=self.input_path,
+                output_path=self.output_path,
+            )
+            interp = getattr(self.config.output, 'cuda_interp_algo', 'bicubic')
+            logger.info(f"Starting GPU FFmpeg encode for {self.media_file.source.name} (CUDA scale: {use_cuda}, algo: {interp})")
+            logger.debug(f"FFmpeg command: {' '.join(cmd)}")
 
-        success, msg = self._execute_process(cmd)
+            success, msg = self._execute_process(cmd)
 
-        # If failed and was using CUDA scaling, attempt fallback to software scaling
-        if not success and not self.is_aborted and use_cuda:
-            logger.warning("CUDA scaling failed, retrying with software Lanczos scaling fallback...")
-            # Clean partial temp output
-            if temp_file.exists():
-                try:
-                    temp_file.unlink()
-                except Exception:
-                    pass
+            # If failed and was using CUDA scaling, attempt fallback to software scaling
+            if not success and not self.is_aborted and use_cuda:
+                logger.warning("CUDA scaling failed, retrying with software scaling fallback...")
+                if temp_file.exists():
+                    try:
+                        temp_file.unlink()
+                    except Exception:
+                        pass
 
-            fallback_cmd = build_ffmpeg_command(self.media_file, self.config, use_cuda_scale=False)
-            logger.info(f"Retrying FFmpeg encode for {self.media_file.source.name} with software scale")
-            success, msg = self._execute_process(fallback_cmd)
+                fallback_cmd = build_ffmpeg_command(
+                    self.media_file,
+                    self.config,
+                    use_cuda_scale=False,
+                    encoder_type="gpu",
+                    input_path=self.input_path,
+                    output_path=self.output_path,
+                )
+                logger.info(f"Retrying GPU FFmpeg encode for {self.media_file.source.name} with software scale")
+                success, msg = self._execute_process(fallback_cmd)
 
         if not success:
             # Clean up temporary output on failure

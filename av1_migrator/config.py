@@ -80,7 +80,11 @@ class OutputConfig:
     width: int = 1920
     height: int = 1080
     prefer_cuda_scale: bool = True
+    cuda_interp_algo: str = "bicubic"  # "bicubic", "bilinear", or "lanczos"
     pixel_format: str = "p010le"
+    cpu_video_codec: str = "auto"  # "auto", "libsvtav1", or "libaom-av1"
+    cpu_preset: str = "6"
+    cpu_crf: int = 28
 
 
 @dataclass
@@ -102,6 +106,9 @@ class StorageConfig:
     minimum_free_space: str = "1TB"
     safety_margin: str = "10GB"
     poll_interval: float = 0.5
+    local_staging_dir: str = "Z:\\JellyfinTranscode"
+    enable_local_staging: bool = True
+    local_min_free_space: str = "20GB"
 
     @property
     def minimum_free_space_bytes(self) -> int:
@@ -110,6 +117,10 @@ class StorageConfig:
     @property
     def safety_margin_bytes(self) -> int:
         return parse_size_to_bytes(self.safety_margin)
+
+    @property
+    def local_min_free_space_bytes(self) -> int:
+        return parse_size_to_bytes(self.local_min_free_space)
 
 
 @dataclass
@@ -121,6 +132,9 @@ class ProcessingConfig:
     pre_encode_check: bool = True  # Toggleable pre-encode space optimization & bloat prediction check
     sample_duration: float = 30.0  # Duration in seconds of sample clip for space optimization test
     min_savings_percent: float = 0.0  # Minimum % space savings required to proceed (0.0 = must not bloat)
+    enable_gpu_encoding: bool = True
+    enable_cpu_encoding: bool = True
+    cpu_max_file_size: Optional[str] = None
     resume: bool = True
     network_retries: int = 3
     network_retry_delay: float = 30.0
@@ -205,7 +219,11 @@ def load_config(config_path: Optional[str | Path] = None) -> AppConfig:
                 width=int(out_data.get("width", config.output.width)),
                 height=int(out_data.get("height", config.output.height)),
                 prefer_cuda_scale=bool(out_data.get("prefer_cuda_scale", config.output.prefer_cuda_scale)),
+                cuda_interp_algo=str(out_data.get("cuda_interp_algo", config.output.cuda_interp_algo)),
                 pixel_format=out_data.get("pixel_format", config.output.pixel_format),
+                cpu_video_codec=str(out_data.get("cpu_video_codec", config.output.cpu_video_codec)),
+                cpu_preset=str(out_data.get("cpu_preset", config.output.cpu_preset)),
+                cpu_crf=int(out_data.get("cpu_crf", config.output.cpu_crf)),
             )
             
         if "audio" in raw_data and isinstance(raw_data["audio"], dict):
@@ -230,6 +248,9 @@ def load_config(config_path: Optional[str | Path] = None) -> AppConfig:
                 minimum_free_space=str(st_data.get("minimum_free_space", config.storage.minimum_free_space)),
                 safety_margin=str(st_data.get("safety_margin", config.storage.safety_margin)),
                 poll_interval=float(st_data.get("poll_interval", config.storage.poll_interval)),
+                local_staging_dir=str(st_data.get("local_staging_dir", config.storage.local_staging_dir)),
+                enable_local_staging=bool(st_data.get("enable_local_staging", config.storage.enable_local_staging)),
+                local_min_free_space=str(st_data.get("local_min_free_space", config.storage.local_min_free_space)),
             )
             
         if "processing" in raw_data and isinstance(raw_data["processing"], dict):
@@ -242,6 +263,9 @@ def load_config(config_path: Optional[str | Path] = None) -> AppConfig:
                 pre_encode_check=bool(pr_data.get("pre_encode_check", config.processing.pre_encode_check)),
                 sample_duration=float(pr_data.get("sample_duration", config.processing.sample_duration)),
                 min_savings_percent=float(pr_data.get("min_savings_percent", config.processing.min_savings_percent)),
+                enable_gpu_encoding=bool(pr_data.get("enable_gpu_encoding", config.processing.enable_gpu_encoding)),
+                enable_cpu_encoding=bool(pr_data.get("enable_cpu_encoding", config.processing.enable_cpu_encoding)),
+                cpu_max_file_size=pr_data.get("cpu_max_file_size", config.processing.cpu_max_file_size),
                 resume=bool(pr_data.get("resume", config.processing.resume)),
                 network_retries=int(pr_data.get("network_retries", config.processing.network_retries)),
                 network_retry_delay=float(pr_data.get("network_retry_delay", config.processing.network_retry_delay)),

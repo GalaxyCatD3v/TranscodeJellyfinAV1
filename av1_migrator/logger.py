@@ -1,13 +1,27 @@
 """
 Logging module for Galaxy AV1 Migrator.
-Provides rotating file logs and console/rich logging handlers.
+Provides rotating file logs and tqdm-safe console logging handlers.
 """
 
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
-from rich.logging import RichHandler
+from tqdm import tqdm
+
+
+class TqdmLoggingHandler(logging.Handler):
+    """
+    Logging handler that routes console output through tqdm.write
+    to ensure active multi-line progress bars are never corrupted or displaced.
+    """
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            tqdm.write(msg)
+            self.flush()
+        except Exception:
+            self.handleError(record)
 
 
 _logger: Optional[logging.Logger] = None
@@ -47,13 +61,10 @@ def setup_logger(
     logger.addHandler(file_handler)
 
     if enable_console:
-        rich_handler = RichHandler(
-            level=logging.DEBUG if verbose else logging.INFO,
-            show_time=True,
-            show_path=False,
-            markup=True,
-        )
-        logger.addHandler(rich_handler)
+        tqdm_handler = TqdmLoggingHandler(level=logging.DEBUG if verbose else logging.INFO)
+        tqdm_formatter = logging.Formatter("[%(asctime)s] [%(levelname)-8s] %(message)s", datefmt="%H:%M:%S")
+        tqdm_handler.setFormatter(tqdm_formatter)
+        logger.addHandler(tqdm_handler)
 
     _logger = logger
     return logger

@@ -54,7 +54,19 @@ def test_encoder_build_command():
     assert "p010le" in cmd
     assert "-color_primaries" in cmd
     assert "bt2020" in cmd
-    assert "hwupload_cuda,scale_cuda=1920:1080:interp_algo=lanczos" in cmd
+    assert "hwupload_cuda,scale_cuda=1920:1080:interp_algo=bicubic" in cmd
+
+    # Test custom interpolation algorithms
+    cmd_bilinear = build_ffmpeg_command(mf, config, use_cuda_scale=True, interp_algo="bilinear")
+    assert "hwupload_cuda,scale_cuda=1920:1080:interp_algo=bilinear" in cmd_bilinear
+
+    cmd_lanczos = build_ffmpeg_command(mf, config, use_cuda_scale=True, interp_algo="lanczos")
+    assert "hwupload_cuda,scale_cuda=1920:1080:interp_algo=lanczos" in cmd_lanczos
+
+    # Test CPU AV1 encoding command
+    cmd_cpu = build_ffmpeg_command(mf, config, use_cuda_scale=False, encoder_type="cpu")
+    assert "scale=1920:1080:flags=bicubic" in cmd_cpu
+    assert ("libsvtav1" in cmd_cpu or "libaom-av1" in cmd_cpu)
 
 
 def test_parse_out_time():

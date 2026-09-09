@@ -22,7 +22,11 @@ output:
   width: 1920
   height: 1080
   prefer_cuda_scale: true
+  cuda_interp_algo: "bicubic"     # Hardware CUDA scaling interpolation: "bicubic", "bilinear", or "lanczos"
   pixel_format: "p010le"
+  cpu_video_codec: "auto"         # CPU AV1 encoder: "auto" (detects libsvtav1 or libaom-av1), "libsvtav1", "libaom-av1"
+  cpu_preset: "6"                 # Preset/speed for CPU encoding (6-8)
+  cpu_crf: 28
 
 audio:
   languages:
@@ -44,6 +48,9 @@ storage:
   minimum_free_space: "1TB"
   safety_margin: "10GB"
   poll_interval: 0.5
+  local_staging_dir: "Z:\\JellyfinTranscode"  # Local fast NVMe directory for zero-latency encoding
+  enable_local_staging: true                 # Stage remote files locally to eliminate GPU starvation
+  local_min_free_space: "20GB"
 
 processing:
   sort: "largest_first"
@@ -53,6 +60,8 @@ processing:
   pre_encode_check: true          # Pre-encode sample analysis to predict space savings & prevent wasted encoding
   sample_duration: 30.0           # Seconds of representative sample clip to test transcode
   min_savings_percent: 0.0        # Minimum % savings required to transcode (0.0 = must not bloat)
+  enable_gpu_encoding: true       # Use NVIDIA RTX 4070 Ti NVENC worker
+  enable_cpu_encoding: true       # Use concurrent CPU AV1 worker alongside GPU
   resume: true
   network_retries: 3
   network_retry_delay: 30.0

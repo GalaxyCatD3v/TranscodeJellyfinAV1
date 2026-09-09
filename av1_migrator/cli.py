@@ -5,14 +5,13 @@ Command Line Interface for Galaxy AV1 Migrator.
 import argparse
 from pathlib import Path
 import sys
-from rich.console import Console
 
+from av1_migrator.benchmark import run_interpolation_benchmark
 from av1_migrator.config import load_config
 from av1_migrator.db import MigrationDB
 from av1_migrator.engine import MigrationEngine
 from av1_migrator.logger import setup_logger
-
-console = Console()
+from av1_migrator.progress import MigrationProgressBar
 
 
 def parse_args() -> argparse.Namespace:
@@ -92,6 +91,41 @@ def parse_args() -> argparse.Namespace:
         help="Reset a specific file record in the migration database",
     )
     parser.add_argument(
+        "--benchmark",
+        nargs="?",
+        const="",
+        default=None,
+        help="Benchmark CUDA scaling interpolation algorithms (bicubic, bilinear, lanczos) on a test clip or file",
+    )
+    parser.add_argument(
+        "--interp-algo",
+        type=str,
+        choices=["bicubic", "bilinear", "lanczos"],
+        default=None,
+        help="Hardware CUDA scaling interpolation algorithm (default: bicubic)",
+    )
+    parser.add_argument(
+        "--no-cpu",
+        action="store_true",
+        help="Disable concurrent CPU AV1 encoding worker",
+    )
+    parser.add_argument(
+        "--no-gpu",
+        action="store_true",
+        help="Disable GPU encoding worker",
+    )
+    parser.add_argument(
+        "--staging-dir",
+        type=str,
+        default=None,
+        help="Path to local fast NVMe staging directory (default: Z:\\JellyfinTranscode)",
+    )
+    parser.add_argument(
+        "--no-staging",
+        action="store_true",
+        help="Disable local staging (encode directly over remote storage)",
+    )
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Enable detailed debug logging to file and console",
@@ -130,6 +164,16 @@ def main() -> int:
         config.processing.sample_duration = args.sample_duration
     if args.min_savings is not None:
         config.processing.min_savings_percent = args.min_savings
+    if args.interp_algo:
+        config.output.cuda_interp_algo = args.interp_algo
+    if args.no_cpu:
+        config.processing.enable_cpu_encoding = False
+    if args.no_gpu:
+        config.processing.enable_gpu_encoding = False
+    if args.staging_dir:
+        config.storage.local_staging_dir = args.staging_dir
+    if args.no_staging:
+        config.storage.enable_local_staging = False
 
     # Setup logger
     logger = setup_logger(
@@ -141,6 +185,12 @@ def main() -> int:
         enable_console=args.no_ui or not sys.stdout.isatty(),
     )
 
+    # Handle --benchmark if requested
+    if args.benchmark is not None:
+        bench_src = args.benchmark if args.benchmark else args.file
+        run_interpolation_benchmark(source_path=bench_src, config=config)
+        return 0
+
     db = MigrationDB(config.database.path)
 
     # Handle --reset-file if requested
@@ -148,11 +198,11 @@ def main() -> int:
         reset_path = Path(args.reset_file).resolve()
         if db.reset_file(reset_path):
             logger.info(f"Successfully reset database record for: {reset_path}")
-            console.print(f"Reset database record for: {reset_path}")
+            MigrationProgressBar.write(f"Reset database record for: {reset_path}")
             return 0
         else:
             logger.warning(f"File not found in database: {reset_path}")
-            console.print(f"File not found in database: {reset_path}")
+            MigrationProgressBar.write(f"File not found in database: {reset_path}")
             return 1
 
     engine = MigrationEngine(
@@ -168,7 +218,7 @@ def main() -> int:
 
     if args.preflight_only:
         ok, lines = engine.run_preflight_checks()
-        console.print("\n".join(lines))
+        MigrationProgressBar.write("\n".join(lines))
         return 0 if ok else 1
 
     try:
@@ -177,12 +227,12 @@ def main() -> int:
             return 1
         return 0
     except KeyboardInterrupt:
-        console.print("\nStopping safely...")
+        MigrationProgressBar.write("\nStopping safely...")
         engine.stop_safely("KeyboardInterrupt")
         return 130
     except Exception as e:
         logger.exception(f"Unhandled error in main migration engine: {e}")
-        console.print(f"\nFatal error: {e}")
+        MigrationProgressBar.write(f"\nFatal error: {e}")
         return 1
 
 

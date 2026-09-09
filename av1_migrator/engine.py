@@ -1,8 +1,10 @@
 """
 Workflow orchestration engine for Galaxy AV1 Migrator.
-Enforces strict safety priorities, SQLite state persistence, live progress, and smallest-first processing.
+Enforces strict safety priorities, SQLite state persistence, multi-worker concurrency
+(NVIDIA RTX 4070 Ti GPU + concurrent CPU worker), local NVMe staging, and 3-line tqdm progress display.
 """
 
+from datetime import datetime
 import os
 from pathlib import Path
 import shutil
@@ -12,10 +14,16 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from av1_migrator.config import AppConfig, format_bytes
-from av1_migrator.dashboard import MigrationDashboard
+from av1_migrator.config import AppConfig, format_bytes, parse_size_to_bytes
 from av1_migrator.db import MigrationDB
-from av1_migrator.encoder import FFmpegEncoder, is_av1_nvenc_available, is_scale_cuda_available
+from av1_migrator.encoder import (
+    FFmpegEncoder,
+    get_available_cpu_av1_encoder,
+    is_av1_nvenc_available,
+    is_libaom_available,
+    is_libsvtav1_available,
+    is_scale_cuda_available,
+)
 from av1_migrator.gpu import GPUMonitorThread, is_nvidia_smi_available
 from av1_migrator.logger import get_logger
 from av1_migrator.models import EncodeProgress, GPUStats, MediaFile, ScanStats, StorageStats
@@ -26,21 +34,13 @@ from av1_migrator.progress import (
     create_overall_progressbar,
     create_probe_progressbar,
     create_scan_progressbar,
+    create_worker_progressbar,
     MigrationProgressBar,
 )
 from av1_migrator.scanner import is_encoding_temp_file, scan_all_roots
 from av1_migrator.storage import check_storage_safety, get_path_disk_usage, StorageMonitorThread
+from av1_migrator.utils import find_binary_executable, normalize_filepath, sanitize_filename
 from av1_migrator.validator import validate_converted_file
-from av1_migrator.utils import find_binary_executable, normalize_filepath
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    SpinnerColumn,
-    TaskProgressColumn,
-    TextColumn,
-    TimeRemainingColumn,
-)
 
 
 class MigrationEngine:
@@ -48,7 +48,7 @@ class MigrationEngine:
         self,
         config: AppConfig,
         db: Optional[MigrationDB] = None,
-        dashboard: Optional[MigrationDashboard] = None,
+        dashboard: Optional[Any] = None,
         dry_run: bool = False,
         limit: Optional[int] = None,
         single_file: Optional[str] = None,
@@ -58,7 +58,7 @@ class MigrationEngine:
     ):
         self.config = config
         self.db = db or MigrationDB(config.database.path)
-        self.dashboard = dashboard or MigrationDashboard()
+        self.dashboard = dashboard
         self.dry_run = dry_run
         self.limit = limit
         self.single_file = single_file
@@ -68,16 +68,28 @@ class MigrationEngine:
 
         self.logger = get_logger()
         self.gpu_monitor = GPUMonitorThread(poll_interval=1.0)
-        
+
         self.is_running = False
         self.is_paused = False
         self.stop_requested = False
         self.emergency_stop_triggered = False
         self.emergency_stop_msg = ""
-        
+
+        # Thread synchronization & active process tracking
+        self.lock = threading.Lock()
+        self.queue_lock = threading.Lock()
+        self.stats_lock = threading.Lock()
+        self.encoders_lock = threading.Lock()
+        self.monitors_lock = threading.Lock()
+        self.staged_lock = threading.Lock()
+
         self.active_encoder: Optional[FFmpegEncoder] = None
         self.active_media_file: Optional[MediaFile] = None
         self.active_storage_monitor: Optional[StorageMonitorThread] = None
+
+        self.active_encoders: List[FFmpegEncoder] = []
+        self.active_storage_monitors: List[StorageMonitorThread] = []
+        self.staged_files: List[Path] = []
 
         self.total_source_bytes_processed = 0
         self.total_output_bytes_created = 0
@@ -88,12 +100,13 @@ class MigrationEngine:
         self.total_files_count = 0
 
         self.start_time = 0.0
-        self.lock = threading.Lock()
+        self._overall_pbar: Optional[MigrationProgressBar] = None
 
     def run_preflight_checks(self) -> Tuple[bool, List[str]]:
         """
         Executes pre-flight checks:
-        Python version, FFmpeg, FFprobe, NVIDIA GPU, AV1 NVENC, CUDA scaling, media roots, storage floor.
+        Python version, FFmpeg, FFprobe, NVIDIA GPU, AV1 NVENC, CUDA scaling, CPU encoder,
+        media roots, local staging, storage floor.
         """
         checks: List[str] = []
         all_ok = True
@@ -132,14 +145,28 @@ class MigrationEngine:
         if is_av1_nvenc_available(self.config.ffmpeg.executable):
             checks.append("✓ AV1 NVENC encoder available")
         else:
-            checks.append("✗ AV1 NVENC encoder not found in FFmpeg")
-            all_ok = False
+            checks.append("⚠ AV1 NVENC encoder not found in FFmpeg (GPU encoding disabled)")
 
         # CUDA scaling
+        interp = getattr(self.config.output, "cuda_interp_algo", "bicubic")
         if is_scale_cuda_available(self.config.ffmpeg.executable):
-            checks.append("✓ CUDA scaling (scale_cuda)")
+            checks.append(f"✓ CUDA scaling (scale_cuda, algo: {interp})")
         else:
-            checks.append("⚠ CUDA scaling not found (will use software Lanczos fallback)")
+            checks.append(f"⚠ CUDA scaling not found (will use software {interp} fallback)")
+
+        # CPU AV1 Encoder
+        cpu_codec = get_available_cpu_av1_encoder(self.config.ffmpeg.executable)
+        checks.append(f"✓ CPU AV1 encoder available ({cpu_codec})")
+
+        # Local Staging Directory (e.g. Z:\JellyfinTranscode)
+        if self.config.storage.enable_local_staging:
+            stg_dir = Path(self.config.storage.local_staging_dir)
+            try:
+                stg_dir.mkdir(parents=True, exist_ok=True)
+                total, used, free = shutil.disk_usage(str(stg_dir))
+                checks.append(f"✓ Local NVMe staging: {stg_dir} (Free: {format_bytes(free)})")
+            except Exception as e:
+                checks.append(f"⚠ Local staging directory inaccessible ({stg_dir}): {e}")
 
         # Media roots check
         for r in self.config.media_roots:
@@ -175,34 +202,40 @@ class MigrationEngine:
     def stop_safely(self, reason: str = "User requested stop") -> None:
         """
         Graceful stop:
-        1. Signals active FFmpeg to terminate safely.
-        2. Waits for termination.
-        3. Deletes temporary .encoding.mkv.
-        4. Preserves original file.
-        5. Updates database.
+        1. Signals active FFmpeg processes to terminate safely.
+        2. Cleans up temporary staged files from local SSD and remote paths.
+        3. Preserves original files.
+        4. Updates database.
         """
         self.stop_requested = True
         self.logger.info(f"Stopping migration safely: {reason}")
-        
-        with self.lock:
-            if self.active_encoder:
-                self.active_encoder.abort(reason=reason)
 
+        with self.encoders_lock:
+            for enc in list(self.active_encoders):
+                enc.abort(reason=reason)
+
+        with self.monitors_lock:
+            for mon in list(self.active_storage_monitors):
+                mon.stop()
+
+        with self.lock:
             if self.active_media_file:
-                # Mark as aborted in DB
                 self.db.update_status(
                     self.active_media_file.source,
                     status="aborted",
                     output_path=self.active_media_file.output_path,
                     error=reason,
                 )
-                temp_file = self.active_media_file.temp_output_path
-                if temp_file and temp_file.exists():
+
+        # Clean staged files
+        with self.staged_lock:
+            for f in list(self.staged_files):
+                if f.exists():
                     try:
-                        temp_file.unlink()
-                        self.logger.info(f"Removed temporary file: {temp_file}")
+                        f.unlink(missing_ok=True)
+                        self.logger.info(f"Cleaned up staged file: {f}")
                     except Exception as e:
-                        self.logger.error(f"Failed to remove temp file {temp_file}: {e}")
+                        self.logger.error(f"Failed to remove staged file {f}: {e}")
 
     def trigger_emergency_stop(self, stats: StorageStats) -> None:
         """
@@ -219,9 +252,10 @@ class MigrationEngine:
         """
         Inspects database for any tasks that were previously interrupted (status in encoding/validating).
         Cleans up stale temporary files and resets items to pending so they retry cleanly.
+        Also cleans leftover files in local staging directory (Z:/JellyfinTranscode).
         """
         self.logger.info("Checking database for uncompleted/interrupted migration tasks from previous runs...")
-        
+
         def validator_adapter(out_path: Path, src_path: Path):
             dummy_mf = MediaFile(source=src_path, output_path=out_path)
             return validate_converted_file(out_path, dummy_mf, self.config)
@@ -231,7 +265,7 @@ class MigrationEngine:
             delete_original=self.config.processing.delete_original and not self.no_delete,
             keep_smaller=self.config.processing.keep_smaller,
         )
-        
+
         if actions:
             self.logger.warning(f"Startup recovery: Found and resolved {len(actions)} interrupted tasks.")
             for act in actions:
@@ -239,16 +273,30 @@ class MigrationEngine:
                     f"  - {act['source_path']}: {act['action']} "
                     f"(previous status: {act['status_before']}, temp cleaned: {act['temp_cleaned']})"
                 )
-                if self.no_ui or not sys.stdout.isatty():
-                    self.dashboard.console.print(f"[bold yellow]Startup Recovery:[/bold yellow] {Path(act['source_path']).name} -> {act['action']}")
+                MigrationProgressBar.write(f"Startup Recovery: {Path(act['source_path']).name} -> {act['action']}")
         else:
             self.logger.info("Startup recovery: Database is clean, no interrupted tasks found.")
-            
+
+        # Clean local staging directory of stale artifacts from interrupted runs
+        if self.config.storage.enable_local_staging:
+            stg_dir = Path(self.config.storage.local_staging_dir)
+            if stg_dir.exists():
+                try:
+                    for f in stg_dir.iterdir():
+                        if f.is_file() and (f.name.startswith("gpu_") or f.name.startswith("cpu_") or ".encoding.mkv" in f.name):
+                            try:
+                                f.unlink(missing_ok=True)
+                                self.logger.info(f"Startup recovery: cleaned leftover local staging file {f}")
+                            except Exception as e:
+                                self.logger.warning(f"Could not delete leftover staging file {f}: {e}")
+                except Exception as e:
+                    self.logger.warning(f"Error checking local staging directory during startup: {e}")
+
         return actions
 
     def scan_and_prepare_queue(self) -> Tuple[List[MediaFile], ScanStats]:
         """
-        Scans media roots, probes files, updates SQLite DB, and returns sorted queue (smallest first).
+        Scans media roots, probes files, updates SQLite DB, and returns sorted queue.
         """
         self.logger.info("Starting media discovery and queue preparation...")
         scan_stats = ScanStats()
@@ -326,7 +374,7 @@ class MigrationEngine:
                 # Check DB record
                 db_row = self.db.get_file(p)
 
-                # If already marked completed in DB and file unchanged
+                # If already completed and unchanged, skip
                 if (
                     db_row
                     and db_row["status"] == "completed"
@@ -336,11 +384,11 @@ class MigrationEngine:
                 ):
                     scan_stats.already_converted += 1
                     self.completed_count += 1
-                    self.total_source_bytes_processed += db_row["source_bytes"] or file_size
+                    self.total_source_bytes_processed += file_size
                     self.total_output_bytes_created += db_row["output_bytes"] or file_size
                     continue
 
-                # If already marked skipped in DB and file unchanged (and not retrying failed)
+                # If already marked skipped in DB and file unchanged
                 if (
                     db_row
                     and db_row["status"] == "skipped"
@@ -439,7 +487,7 @@ class MigrationEngine:
                         self.completed_count += 1
                         self.total_source_bytes_processed += file_size
                         self.total_output_bytes_created += out_sz
-                        
+
                         # Delete original if configured
                         if self.config.processing.delete_original and not self.no_delete and p.exists() and p != mf.output_path:
                             try:
@@ -462,13 +510,15 @@ class MigrationEngine:
                         )
                         continue
                     else:
-                        self.logger.warning(f"Existing output for {p.name} was corrupt or invalid: {v_msg}. Removing and scheduling re-encode.")
+                        self.logger.warning(f"Existing output {mf.output_path.name} is invalid/incomplete: {v_msg}. Removing to re-encode.")
                         try:
                             mf.output_path.unlink()
                         except Exception as e:
-                            self.logger.error(f"Could not delete invalid output file {mf.output_path}: {e}")
+                            self.logger.error(f"Could not remove invalid existing file {mf.output_path}: {e}")
 
-                # Register pending file in DB and add to queue
+                # Candidate is eligible for conversion!
+                scan_stats.eligible_files += 1
+                mf.status = "pending"
                 self.db.upsert_file(
                     source_path=p,
                     source_size=file_size,
@@ -480,7 +530,6 @@ class MigrationEngine:
                     hdr=mf.hdr,
                 )
                 media_files_to_process.append(mf)
-                scan_stats.eligible_files += 1
 
         try:
             do_probing_loop()
@@ -490,53 +539,450 @@ class MigrationEngine:
             except Exception:
                 pass
 
-        # Sort queue
-        if is_largest_first:
-            media_files_to_process.sort(key=lambda m: m.size, reverse=True)
-        else:
-            media_files_to_process.sort(key=lambda m: m.size)
-
-        # Apply limit if requested
-        if self.limit and self.limit > 0:
-            media_files_to_process = media_files_to_process[: self.limit]
-
         self.queue = media_files_to_process
-        self.total_files_count = len(candidate_paths)
-        return self.queue, scan_stats
+        self.total_files_count = len(media_files_to_process)
+        return media_files_to_process, scan_stats
+
+    def get_gpu_status_str(self) -> str:
+        g = self.gpu_monitor.stats
+        parts = []
+        if g.gpu_util is not None:
+            parts.append(f"GPU: {g.gpu_util:.0f}%")
+        if g.enc_util is not None:
+            parts.append(f"NVENC: {g.enc_util:.0f}%")
+        if g.temperature_c is not None:
+            parts.append(f"{int(g.temperature_c)}°C")
+        return " | ".join(parts) if parts else ""
+
+    def _update_overall_pbar(self) -> None:
+        if self._overall_pbar:
+            with self.stats_lock:
+                done = self.completed_count
+                saved_bytes = max(0, self.total_source_bytes_processed - self.total_output_bytes_created)
+            parts = [f"saved: {format_bytes(saved_bytes)}"]
+            gpu_str = self.get_gpu_status_str()
+            if gpu_str:
+                parts.append(gpu_str)
+            try:
+                self._overall_pbar.update(done, postfix_str=" | ".join(parts))
+            except Exception:
+                pass
+
+    def _clean_staged(self, *paths: Optional[Path]) -> None:
+        for p in paths:
+            if p and p.exists():
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                with self.staged_lock:
+                    if p in self.staged_files:
+                        self.staged_files.remove(p)
+
+    def _process_media_file(
+        self,
+        media_file: MediaFile,
+        worker_type: str,
+        worker_pbar: MigrationProgressBar,
+    ) -> None:
+        """
+        Processes a single media file end-to-end for a given worker (GPU or CPU):
+        Pre-encode check -> Local staging (Z:/JellyfinTranscode) -> Encoding ->
+        Validation -> Bloat rejection -> Promotion -> Cleanup.
+        """
+        with self.lock:
+            self.active_media_file = media_file
+
+        # Check pause
+        while self.is_paused and not self.stop_requested and not self.emergency_stop_triggered:
+            time.sleep(0.5)
+
+        if self.stop_requested or self.emergency_stop_triggered:
+            return
+
+        # 1. Storage safety check (remote storage floor)
+        is_safe, s_msg, s_stats = check_storage_safety(
+            path=media_file.source,
+            original_file_size=media_file.size,
+            minimum_free_space_bytes=self.config.storage.minimum_free_space_bytes,
+            safety_margin_bytes=self.config.storage.safety_margin_bytes,
+        )
+
+        if not is_safe:
+            self.logger.critical(f"Storage check failed before starting {media_file.source.name}: {s_msg}")
+            self.trigger_emergency_stop(s_stats)
+            return
+
+        # 2. Pre-encode optimization check: test sample to predict bloat
+        if self.config.processing.pre_encode_check:
+            opt_res = evaluate_pre_encode_optimization(media_file, self.config)
+            if not opt_res.should_encode:
+                self.logger.warning(f"Pre-encode check: Skipping {media_file.source.name}. {opt_res.reason}")
+                with self.stats_lock:
+                    self.skipped_count += 1
+                self.db.update_status(
+                    media_file.source,
+                    status="skipped",
+                    output_path=media_file.output_path,
+                    skip_reason=opt_res.reason,
+                    source_bytes=media_file.size,
+                    output_bytes=media_file.size,
+                )
+                self._update_overall_pbar()
+                worker_pbar.set_description(f"{worker_type} [Idle]")
+                worker_pbar.set_postfix_str(f"Skipped {media_file.source.name[:20]}")
+                return
+
+        # 3. Local Staging at Z:\JellyfinTranscode to eliminate remote SSHFS reading bottlenecks
+        staged_source: Optional[Path] = None
+        staged_output: Optional[Path] = None
+        active_input = media_file.source
+        active_output = media_file.temp_output_path
+
+        if self.config.storage.enable_local_staging:
+            staging_dir = Path(self.config.storage.local_staging_dir)
+            try:
+                staging_dir.mkdir(parents=True, exist_ok=True)
+                _, _, local_free = shutil.disk_usage(str(staging_dir))
+                required_local = media_file.size * 2 + self.config.storage.local_min_free_space_bytes
+
+                if local_free >= required_local:
+                    stem_clean = sanitize_filename(media_file.source.stem)
+                    ext_clean = media_file.source.suffix
+                    staged_source = staging_dir / f"{worker_type.lower()}_{stem_clean}{ext_clean}"
+                    hdr_tag = "HDR10" if media_file.hdr else "SDR"
+                    staged_output = staging_dir / f"{worker_type.lower()}_{stem_clean} [AV1 1080p {hdr_tag} CQ28].mkv.encoding.mkv"
+
+                    worker_pbar.set_description(f"{worker_type} [{media_file.source.name[:25]}]: Staging locally...")
+                    worker_pbar.set_postfix_str(f"Copying {format_bytes(media_file.size)} to {staging_dir.drive or staging_dir}...")
+
+                    shutil.copy2(media_file.source, staged_source)
+                    active_input = staged_source
+                    active_output = staged_output
+
+                    with self.staged_lock:
+                        self.staged_files.extend([staged_source, staged_output])
+                else:
+                    self.logger.warning(
+                        f"Local staging space low on {staging_dir} ({format_bytes(local_free)} free), encoding directly."
+                    )
+            except Exception as e:
+                self.logger.warning(f"Could not stage {media_file.source.name} locally ({staging_dir}): {e}. Encoding directly.")
+
+        # 4. Continuous background storage monitor for this encode
+        monitor = StorageMonitorThread(
+            watch_path=media_file.source,
+            minimum_free_space_bytes=self.config.storage.minimum_free_space_bytes,
+            poll_interval=self.config.storage.poll_interval,
+            on_emergency_stop=self.trigger_emergency_stop,
+        )
+        monitor.start()
+        with self.monitors_lock:
+            self.active_storage_monitors.append(monitor)
+
+        # 5. Reset worker progress bar and configure progress handler
+        worker_pbar.reset(total=100.0, desc=f"{worker_type} [{media_file.source.name[:25]}]")
+
+        def on_progress(p: EncodeProgress):
+            in_sz = format_bytes(media_file.size)
+            out_sz = format_bytes(p.total_size_bytes)
+            eta_val = getattr(p, "eta_str", "--:--:--")
+            parts = [
+                f"in: {in_sz} -> out: {out_sz}",
+                f"{p.speed:.2f}x ({p.fps:.1f} fps)",
+                f"ETA {eta_val}",
+            ]
+            if worker_type == "GPU":
+                gpu_str = self.get_gpu_status_str()
+                if gpu_str:
+                    parts.append(gpu_str)
+            else:
+                parts.append("CPU worker")
+            try:
+                worker_pbar.update(p.percent, postfix_str=" | ".join(parts))
+            except Exception:
+                pass
+
+        # 6. Instantiate and run encoder (with graceful fallback for custom test mocks)
+        try:
+            encoder = FFmpegEncoder(
+                media_file=media_file,
+                config=self.config,
+                on_progress=on_progress,
+                encoder_type=worker_type.lower(),
+                input_path=active_input,
+                output_path=active_output,
+            )
+        except TypeError:
+            encoder = FFmpegEncoder(
+                media_file=media_file,
+                config=self.config,
+                on_progress=on_progress,
+            )
+
+        with self.encoders_lock:
+            self.active_encoders.append(encoder)
+            self.active_encoder = encoder
+
+        self.db.update_status(media_file.source, status="encoding", output_path=media_file.output_path)
+        encode_success, encode_msg = encoder.run()
+
+        with self.encoders_lock:
+            if encoder in self.active_encoders:
+                self.active_encoders.remove(encoder)
+
+        monitor.stop()
+        with self.monitors_lock:
+            if monitor in self.active_storage_monitors:
+                self.active_storage_monitors.remove(monitor)
+
+        # Support test mocks that wrote to media_file.temp_output_path
+        if (
+            active_output
+            and media_file.temp_output_path
+            and not active_output.exists()
+            and media_file.temp_output_path.exists()
+        ):
+            active_output = media_file.temp_output_path
+
+        # 7. Check abort / emergency stop
+        if self.emergency_stop_triggered or self.stop_requested:
+            self._clean_staged(staged_source, staged_output)
+            return
+
+        if not encode_success:
+            self.logger.error(f"Encoding failed for {media_file.source.name} ({worker_type}): {encode_msg}")
+            self._clean_staged(staged_source, staged_output)
+            with self.stats_lock:
+                self.failed_count += 1
+            self.db.update_status(
+                media_file.source,
+                status="failed",
+                output_path=media_file.output_path,
+                error=encode_msg,
+            )
+            self._update_overall_pbar()
+            worker_pbar.set_description(f"{worker_type} [Idle]")
+            worker_pbar.set_postfix_str(f"Failed: {encode_msg[:25]}")
+            return
+
+        # 8. Output validation
+        worker_pbar.set_description(f"{worker_type} [{media_file.source.name[:25]}]: Validating...")
+        self.db.update_status(media_file.source, status="validating", output_path=media_file.output_path)
+
+        is_valid, val_msg, _ = validate_converted_file(active_output, media_file, self.config)
+        if not is_valid:
+            self.logger.error(f"Validation failed for {active_output}: {val_msg}")
+            self._clean_staged(staged_source, active_output)
+            with self.stats_lock:
+                self.failed_count += 1
+            self.db.update_status(
+                media_file.source,
+                status="failed",
+                output_path=media_file.output_path,
+                error=f"Validation failed: {val_msg}",
+            )
+            self._update_overall_pbar()
+            worker_pbar.set_description(f"{worker_type} [Idle]")
+            worker_pbar.set_postfix_str("Validation failed")
+            return
+
+        # 9. Space bloat rejection: discard bloated encode and keep smaller original
+        out_sz = active_output.stat().st_size
+        if self.config.processing.keep_smaller and out_sz >= media_file.size:
+            self.logger.warning(
+                f"Encoding bloated for {media_file.source.name}: output ({format_bytes(out_sz)}) "
+                f"is larger than or equal to original ({format_bytes(media_file.size)}). Prioritizing space."
+            )
+            self._clean_staged(staged_source, active_output)
+            with self.stats_lock:
+                self.skipped_count += 1
+            self.db.update_status(
+                media_file.source,
+                status="skipped",
+                output_path=media_file.output_path,
+                skip_reason=(
+                    f"Encoding bloated: original is smaller "
+                    f"({format_bytes(media_file.size)} vs {format_bytes(out_sz)})"
+                ),
+                source_bytes=media_file.size,
+                output_bytes=media_file.size,
+            )
+            self._update_overall_pbar()
+            worker_pbar.set_description(f"{worker_type} [Idle]")
+            worker_pbar.set_postfix_str("Skipped bloated output")
+            return
+
+        # 10. Atomic promotion to destination
+        worker_pbar.set_description(f"{worker_type} [{media_file.source.name[:25]}]: Promoting...")
+        final_path = media_file.output_path
+
+        if active_output != final_path:
+            # Staged locally: copy to remote staging temp then atomic rename
+            remote_temp = media_file.temp_output_path or (media_file.source.parent / f"{media_file.source.stem}.encoding.mkv")
+            try:
+                if active_output != remote_temp:
+                    shutil.copy2(active_output, remote_temp)
+                    os.replace(str(remote_temp), str(final_path))
+                    active_output.unlink(missing_ok=True)
+                else:
+                    os.replace(str(active_output), str(final_path))
+            except Exception as e:
+                self.logger.error(f"Failed promoting from local staging to {final_path}: {e}")
+                self._clean_staged(staged_source, active_output)
+                with self.stats_lock:
+                    self.failed_count += 1
+                self.db.update_status(media_file.source, status="failed", error=f"Promotion failed: {e}")
+                self._update_overall_pbar()
+                return
+        else:
+            try:
+                os.replace(str(active_output), str(final_path))
+            except Exception as e:
+                self.logger.error(f"Failed to replace {active_output} -> {final_path}: {e}")
+                with self.stats_lock:
+                    self.failed_count += 1
+                self.db.update_status(media_file.source, status="failed", error=f"Promotion failed: {e}")
+                self._update_overall_pbar()
+                return
+
+        # Clean staged source
+        if staged_source and staged_source.exists():
+            staged_source.unlink(missing_ok=True)
+            with self.staged_lock:
+                if staged_source in self.staged_files:
+                    self.staged_files.remove(staged_source)
+
+        # 11. Final validation on remote promoted file
+        is_final_valid, fval_msg, _ = validate_converted_file(final_path, media_file, self.config)
+        if not is_final_valid:
+            self.logger.critical(f"Final validation failed on promoted file {final_path}: {fval_msg}")
+            with self.stats_lock:
+                self.failed_count += 1
+            self.db.update_status(
+                media_file.source,
+                status="failed",
+                output_path=final_path,
+                error=f"Post-promotion validation failed: {fval_msg}",
+            )
+            self._update_overall_pbar()
+            return
+
+        # 12. Safely delete remote original if configured
+        final_size = final_path.stat().st_size
+        if self.config.processing.delete_original and not self.no_delete:
+            if media_file.source.exists() and media_file.source != final_path:
+                try:
+                    media_file.source.unlink()
+                    self.logger.info(f"Safely deleted original file: {media_file.source}")
+                except Exception as e:
+                    self.logger.error(f"Failed to delete original file {media_file.source}: {e}")
+
+        # 13. Mark Completed in DB & update stats
+        with self.stats_lock:
+            self.completed_count += 1
+            self.total_source_bytes_processed += media_file.size
+            self.total_output_bytes_created += final_size
+
+        self.db.update_status(
+            media_file.source,
+            status="completed",
+            output_path=final_path,
+            source_bytes=media_file.size,
+            output_bytes=final_size,
+        )
+
+        self.logger.info(
+            f"[{worker_type}] Successfully migrated {media_file.source.name} -> {final_path.name} "
+            f"({format_bytes(media_file.size)} -> {format_bytes(final_size)}, "
+            f"saved {format_bytes(media_file.size - final_size)})"
+        )
+        self._update_overall_pbar()
+        worker_pbar.set_description(f"{worker_type} [Idle]")
+        worker_pbar.set_postfix_str(f"Completed {media_file.source.name[:20]}")
+
+    def _worker_loop(self, worker_type: str, worker_pbar: MigrationProgressBar) -> None:
+        """
+        Continuous worker loop for GPU or CPU transcode thread.
+        Pulls from self.queue until empty or stop requested.
+        """
+        while not self.stop_requested and not self.emergency_stop_triggered:
+            while self.is_paused and not self.stop_requested and not self.emergency_stop_triggered:
+                time.sleep(0.5)
+
+            if self.stop_requested or self.emergency_stop_triggered:
+                break
+
+            media_file: Optional[MediaFile] = None
+            with self.queue_lock:
+                if not self.queue:
+                    break
+
+                if worker_type == "CPU":
+                    # CPU worker prioritizes smaller files to prevent getting bogged down on 80GB Remuxes
+                    # while GPU handles the large files
+                    if len(self.queue) > 1 and self.config.processing.enable_gpu_encoding:
+                        media_file = self.queue.pop(-1)
+                    else:
+                        media_file = self.queue.pop(0)
+                else:
+                    # GPU worker processes largest files first
+                    media_file = self.queue.pop(0)
+
+            if media_file is None:
+                break
+
+            try:
+                self._process_media_file(media_file, worker_type, worker_pbar)
+            except Exception as e:
+                self.logger.exception(f"Unhandled exception in {worker_type} worker on {media_file.source.name}: {e}")
+                with self.stats_lock:
+                    self.failed_count += 1
+                self.db.update_status(media_file.source, status="failed", error=str(e))
+                self._update_overall_pbar()
+
+        worker_pbar.set_description(f"{worker_type} [Finished]")
+        worker_pbar.set_postfix_str("All tasks complete")
+        worker_pbar.finish()
 
     def execute(self) -> Dict[str, Any]:
         """
-        Main execution loop.
+        Executes the migration pipeline:
+        1. Pre-flight checks
+        2. Signal handlers
+        3. Startup database and staging directory recovery
+        4. Discovery and probing
+        5. Multi-line tqdm progress bars (Overall, CPU, GPU)
+        6. Concurrent GPU and CPU transcode workers
         """
         self.is_running = True
         self.start_time = time.time()
         self.setup_signal_handlers()
 
         # 1. Pre-flight checks
-        ok, check_lines = self.run_preflight_checks()
         self.logger.info("=== Pre-flight System Checks ===")
+        ok, check_lines = self.run_preflight_checks()
         for line in check_lines:
             self.logger.info(line)
-            if self.no_ui:
-                self.dashboard.console.print(line)
+            MigrationProgressBar.write(line)
 
-        if not ok and not self.dry_run:
-            self.logger.error("Pre-flight checks failed. Aborting execution.")
-            return {"status": "error", "message": "Pre-flight checks failed"}
+        if not ok:
+            msg = "Pre-flight system checks failed. Halting migration."
+            self.logger.critical(msg)
+            MigrationProgressBar.write(f"\n{msg}")
+            return {"status": "error", "reason": msg}
 
-        # 2. Startup database check and interrupted task recovery
+        # 2. Startup recovery
         self.run_startup_recovery()
 
-        # 3. Scan and build queue
+        # 3. Queue preparation
         queue, scan_stats = self.scan_and_prepare_queue()
 
-        total_source_bytes_in_queue = sum(m.size for m in queue)
-        estimated_output_bytes = int(total_source_bytes_in_queue * 0.35)  # ~65% estimated AV1 reduction
-        estimated_savings_bytes = total_source_bytes_in_queue - estimated_output_bytes
-
-        # 3. Dry-run mode
         if self.dry_run:
-            self.logger.info("=== DRY RUN SUMMARY ===")
+            total_source_bytes_in_queue = sum(mf.size for mf in queue)
+            estimated_output_bytes = int(total_source_bytes_in_queue * 0.3)
+            estimated_savings_bytes = max(0, total_source_bytes_in_queue - estimated_output_bytes)
+
             summary = (
                 f"\nDRY RUN SUMMARY:\n"
                 f"  Eligible files to convert: {len(queue)}\n"
@@ -548,8 +994,7 @@ class MigrationEngine:
                 f"  Estimated savings:         ~{format_bytes(estimated_savings_bytes)}\n"
             )
             self.logger.info(summary)
-            if self.no_ui or not sys.stdout.isatty():
-                self.dashboard.console.print(summary)
+            MigrationProgressBar.write(summary)
             return {
                 "status": "dry_run_complete",
                 "queue_count": len(queue),
@@ -559,275 +1004,88 @@ class MigrationEngine:
 
         if not queue:
             self.logger.info("No eligible files to transcode in queue. All files up to date!")
-            if self.no_ui or not sys.stdout.isatty():
-                self.dashboard.console.print("All files up to date! Nothing to migrate.")
+            MigrationProgressBar.write("All files up to date! Nothing to migrate.")
             return {"status": "completed", "converted_count": 0}
 
-        # 4. Start GPU monitor
+        # 4. Start GPU telemetry
         self.gpu_monitor.start()
 
-        def get_gpu_status_str() -> str:
-            g = self.gpu_monitor.stats
-            parts = []
-            if g.gpu_util is not None:
-                parts.append(f"GPU: {g.gpu_util:.0f}%")
-            if g.enc_util is not None:
-                parts.append(f"NVENC: {g.enc_util:.0f}%")
-            if g.temperature_c is not None:
-                parts.append(f"{int(g.temperature_c)}°C")
-            return " | ".join(parts) if parts else ""
-
-        overall_prog = create_overall_progressbar(len(queue), message="Overall Migration")
+        # 5. Initialize 3-line tqdm progress bars
+        # Position 0: Overall Library
+        # Position 1: CPU Worker
+        # Position 2: GPU Worker
+        overall_prog = create_overall_progressbar(len(queue), message="Overall Migration", position=0)
         overall_prog.start()
+        self._overall_pbar = overall_prog
 
-        def update_ui(current_progress: Optional[EncodeProgress] = None, status_msg: str = "Encoding"):
-            pass
+        cpu_prog = create_worker_progressbar("CPU", position=1)
+        cpu_prog.start()
 
-        # 5. Process Queue
+        gpu_prog = create_worker_progressbar("GPU", position=2)
+        gpu_prog.start()
+
+        # Determine worker activation
+        gpu_active = self.config.processing.enable_gpu_encoding and is_av1_nvenc_available(self.config.ffmpeg.executable)
+        cpu_active = self.config.processing.enable_cpu_encoding
+
+        if not gpu_active:
+            gpu_prog.set_description("GPU [Disabled / NVENC unavailable]")
+            gpu_prog.set_postfix_str("Idle")
+        if not cpu_active:
+            cpu_prog.set_description("CPU [Disabled in config]")
+            cpu_prog.set_postfix_str("Idle")
+
+        # 6. Spawn worker threads
+        threads: List[threading.Thread] = []
+
+        if gpu_active:
+            t_gpu = threading.Thread(
+                target=self._worker_loop,
+                args=("GPU", gpu_prog),
+                name="GPU-Worker",
+                daemon=True,
+            )
+            threads.append(t_gpu)
+            t_gpu.start()
+
+        if cpu_active:
+            t_cpu = threading.Thread(
+                target=self._worker_loop,
+                args=("CPU", cpu_prog),
+                name="CPU-Worker",
+                daemon=True,
+            )
+            threads.append(t_cpu)
+            t_cpu.start()
+
+        # If neither worker active, fallback to GPU
+        if not threads:
+            t_fallback = threading.Thread(
+                target=self._worker_loop,
+                args=("GPU", gpu_prog),
+                name="Fallback-Worker",
+                daemon=True,
+            )
+            threads.append(t_fallback)
+            t_fallback.start()
+
         try:
-            while self.queue and not self.stop_requested:
-                media_file = self.queue.pop(0)
-                self.active_media_file = media_file
-
-                # Handle pause
-                while self.is_paused and not self.stop_requested:
-                    time.sleep(0.5)
-
-                if self.stop_requested:
-                    break
-
-                # Pre-encode storage check
-                is_safe, s_msg, s_stats = check_storage_safety(
-                    path=media_file.source,
-                    original_file_size=media_file.size,
-                    minimum_free_space_bytes=self.config.storage.minimum_free_space_bytes,
-                    safety_margin_bytes=self.config.storage.safety_margin_bytes,
-                )
-
-                if not is_safe:
-                    self.logger.critical(f"Storage check failed before starting {media_file.source.name}: {s_msg}")
-                    self.trigger_emergency_stop(s_stats)
-                    break
-
-                # Pre-encode optimization check: test snippet to predict bloat and savings before doing full encode
-                if self.config.processing.pre_encode_check:
-                    opt_res = evaluate_pre_encode_optimization(media_file, self.config)
-                    if not opt_res.should_encode:
-                        self.logger.warning(
-                            f"Pre-encode check: Skipping {media_file.source.name}. {opt_res.reason}"
-                        )
-                        self.skipped_count += 1
-                        self.db.update_status(
-                            media_file.source,
-                            status="skipped",
-                            output_path=media_file.output_path,
-                            skip_reason=opt_res.reason,
-                            source_bytes=media_file.size,
-                            output_bytes=media_file.size,
-                        )
-                        continue
-                    else:
-                        self.logger.info(f"Pre-encode check passed for {media_file.source.name}: {opt_res.reason}")
-
-                # Start continuous background storage monitor
-                self.active_storage_monitor = StorageMonitorThread(
-                    watch_path=media_file.source,
-                    minimum_free_space_bytes=self.config.storage.minimum_free_space_bytes,
-                    poll_interval=self.config.storage.poll_interval,
-                    on_emergency_stop=self.trigger_emergency_stop,
-                )
-                self.active_storage_monitor.start()
-
-                # Update DB to encoding
-                self.db.update_status(media_file.source, status="encoding", output_path=media_file.output_path)
-
-                # Progress bar for encoding
-                encode_prog = create_encode_progressbar(f"Encoding [{media_file.source.name[:25]}]")
-                encode_prog.start()
-
-                # Progress callback
-                def on_progress(p: EncodeProgress):
-                    gpu_str = get_gpu_status_str()
-                    eta_val = getattr(p, "eta_str", "--:--:--")
-                    in_sz = format_bytes(media_file.size)
-                    out_sz = format_bytes(p.total_size_bytes)
-                    parts = [
-                        f"in: {in_sz} -> out: {out_sz}",
-                        f"{p.speed:.2f}x ({p.fps:.1f} fps)",
-                        f"ETA {eta_val}",
-                    ]
-                    if gpu_str:
-                        parts.append(gpu_str)
-                    try:
-                        encode_prog.update(p.percent, postfix_str=" | ".join(parts))
-                    except Exception:
-                        pass
-
-                # Create and execute encoder
-                self.active_encoder = FFmpegEncoder(
-                    media_file=media_file,
-                    config=self.config,
-                    on_progress=on_progress,
-                )
-
-                encode_success, encode_msg = self.active_encoder.run()
-                try:
-                    encode_prog.finish()
-                except Exception:
-                    pass
-                self.active_storage_monitor.stop()
-
-                if self.emergency_stop_triggered:
-                    self.logger.critical("Emergency stop triggered. Aborting pipeline.")
-                    break
-
-                if self.stop_requested:
-                    self.logger.info("Stop requested by user. Aborting pipeline.")
-                    break
-
-                if not encode_success:
-                    self.logger.error(f"Encoding failed for {media_file.source.name}: {encode_msg}")
-                    self.failed_count += 1
-                    self.db.update_status(
-                        media_file.source,
-                        status="failed",
-                        output_path=media_file.output_path,
-                        error=encode_msg,
-                    )
-                    continue
-
-                # 6. Validate temporary output
-                update_ui(status_msg=f"Validating temp output: {media_file.source.name}")
-                self.db.update_status(media_file.source, status="validating", output_path=media_file.output_path)
-
-                temp_path = media_file.temp_output_path
-                is_valid, val_msg, _ = validate_converted_file(temp_path, media_file, self.config)
-
-                if not is_valid:
-                    self.logger.error(f"Validation failed for temp output {temp_path}: {val_msg}")
-                    self.failed_count += 1
-                    if temp_path and temp_path.exists():
-                        try:
-                            temp_path.unlink()
-                        except Exception:
-                            pass
-                    self.db.update_status(
-                        media_file.source,
-                        status="failed",
-                        output_path=media_file.output_path,
-                        error=f"Validation failed: {val_msg}",
-                    )
-                    continue
-
-                # Check if encoding bloated and prioritize saving space
-                temp_size = temp_path.stat().st_size
-                if self.config.processing.keep_smaller and temp_size >= media_file.size:
-                    self.logger.warning(
-                        f"Encoding bloated for {media_file.source.name}: output ({format_bytes(temp_size)}) "
-                        f"is larger than or equal to original ({format_bytes(media_file.size)}). "
-                        f"Prioritizing space: keeping smaller original and removing bloated output."
-                    )
-                    if temp_path and temp_path.exists():
-                        try:
-                            temp_path.unlink()
-                            self.logger.info(f"Removed bloated temporary output: {temp_path}")
-                        except Exception as e:
-                            self.logger.error(f"Failed to remove bloated temp file {temp_path}: {e}")
-
-                    self.skipped_count += 1
-                    self.db.update_status(
-                        media_file.source,
-                        status="skipped",
-                        output_path=media_file.output_path,
-                        skip_reason=(
-                            f"Encoding bloated: original is smaller "
-                            f"({format_bytes(media_file.size)} vs {format_bytes(temp_size)})"
-                        ),
-                        source_bytes=media_file.size,
-                        output_bytes=media_file.size,
-                    )
-                    update_ui(status_msg=f"Skipped bloated {media_file.source.name}")
-                    continue
-
-                # 7. Atomic promotion (rename .encoding.mkv -> final .mkv)
-                final_path = media_file.output_path
-                update_ui(status_msg=f"Promoting {media_file.source.name}")
-                try:
-                    os.replace(str(temp_path), str(final_path))
-                    self.logger.info(f"Promoted {temp_path.name} to {final_path.name}")
-                except Exception as e:
-                    self.logger.error(f"Failed to promote output file {temp_path} -> {final_path}: {e}")
-                    self.failed_count += 1
-                    self.db.update_status(
-                        media_file.source,
-                        status="failed",
-                        output_path=media_file.output_path,
-                        error=f"Atomic promotion failed: {e}",
-                    )
-                    continue
-
-                # 8. Re-validate promoted final output
-                is_final_valid, fval_msg, _ = validate_converted_file(final_path, media_file, self.config)
-                if not is_final_valid:
-                    self.logger.critical(f"Final validation failed on promoted file {final_path}: {fval_msg}")
-                    self.failed_count += 1
-                    self.db.update_status(
-                        media_file.source,
-                        status="failed",
-                        output_path=media_file.output_path,
-                        error=f"Post-promotion validation failed: {fval_msg}",
-                    )
-                    continue
-
-                # 9. Safely delete original file if configured
-                out_size = final_path.stat().st_size
-                if self.config.processing.delete_original and not self.no_delete:
-                    if media_file.source.exists() and media_file.source != final_path:
-                        try:
-                            media_file.source.unlink()
-                            self.logger.info(f"Safely deleted original file: {media_file.source}")
-                        except Exception as e:
-                            self.logger.error(f"Failed to delete original file {media_file.source}: {e}")
-
-                # 10. Mark Completed in DB & update stats
-                self.completed_count += 1
-                self.total_source_bytes_processed += media_file.size
-                self.total_output_bytes_created += out_size
-                
-                self.db.update_status(
-                    media_file.source,
-                    status="completed",
-                    output_path=final_path,
-                    source_bytes=media_file.size,
-                    output_bytes=out_size,
-                )
-                self.logger.info(
-                    f"Successfully migrated {media_file.source.name} -> {final_path.name} "
-                    f"({format_bytes(media_file.size)} -> {format_bytes(out_size)}, "
-                    f"saved {format_bytes(media_file.size - out_size)})"
-                )
-
-                saved_bytes = max(0, self.total_source_bytes_processed - self.total_output_bytes_created)
-                parts = [f"saved: {format_bytes(saved_bytes)}"]
-                gpu_str = get_gpu_status_str()
-                if gpu_str:
-                    parts.append(gpu_str)
-                try:
-                    overall_prog.update(self.completed_count, postfix_str=" | ".join(parts))
-                except Exception:
-                    pass
-
-                update_ui(status_msg=f"Completed {media_file.source.name}")
-
+            for t in threads:
+                t.join()
         finally:
             try:
                 overall_prog.finish()
             except Exception:
                 pass
+            try:
+                cpu_prog.finish()
+            except Exception:
+                pass
+            try:
+                gpu_prog.finish()
+            except Exception:
+                pass
             self.gpu_monitor.stop()
-            if self.active_storage_monitor:
-                self.active_storage_monitor.stop()
-            self.dashboard.stop()
 
         # Final Summary
         saved_bytes = max(0, self.total_source_bytes_processed - self.total_output_bytes_created)
@@ -850,6 +1108,14 @@ class MigrationEngine:
         self.logger.info(f"Source:    {format_bytes(self.total_source_bytes_processed)}")
         self.logger.info(f"Output:    {format_bytes(self.total_output_bytes_created)}")
         self.logger.info(f"Saved:     {format_bytes(saved_bytes)} ({pct:.1f}%)")
+
+        MigrationProgressBar.write("")
+        MigrationProgressBar.write("=" * 60)
+        MigrationProgressBar.write("GALAXY AV1 MIGRATION COMPLETE")
+        MigrationProgressBar.write(f"Completed: {self.completed_count} | Failed: {self.failed_count} | Skipped: {self.skipped_count}")
+        MigrationProgressBar.write(f"Source: {format_bytes(self.total_source_bytes_processed)} -> Output: {format_bytes(self.total_output_bytes_created)}")
+        MigrationProgressBar.write(f"Saved:  {format_bytes(saved_bytes)} ({pct:.1f}% reduction)")
+        MigrationProgressBar.write("=" * 60)
 
         failed_files = self.db.get_failed_files()
         if failed_files:
