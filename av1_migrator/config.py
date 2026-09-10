@@ -125,7 +125,7 @@ class StorageConfig:
 
 @dataclass
 class ProcessingConfig:
-    sort: str = "largest_first"  # "largest_first" or "smallest_first"
+    sort: str = "largest_first"  # "largest_first" (or "biggest_first") or "smallest_first"
     delete_original: bool = True
     validate_output: bool = True
     keep_smaller: bool = True
@@ -133,10 +133,13 @@ class ProcessingConfig:
     sample_duration: float = 30.0  # Duration in seconds of sample clip for space optimization test
     min_savings_percent: float = 0.0  # Minimum % space savings required to proceed (0.0 = must not bloat)
     enable_gpu_encoding: bool = True
+    enable_gpu1: bool = True  # Enable GPU 1 NVENC worker
+    enable_gpu2: bool = True  # Enable GPU 2 NVENC worker
     gpu_workers: int = 2  # Number of concurrent GPU workers (default: 2 to saturate dual NVENC engines)
     enable_cpu_encoding: bool = True
     cpu_max_file_size: Optional[str] = None
     resume: bool = True
+    scan_cache_hours: float = 24.0  # Skip remote filesystem walk if last scan was < 24h ago
     network_retries: int = 3
     network_retry_delay: float = 30.0
     duration_tolerance: float = 2.0  # seconds
@@ -265,10 +268,13 @@ def load_config(config_path: Optional[str | Path] = None) -> AppConfig:
                 sample_duration=float(pr_data.get("sample_duration", config.processing.sample_duration)),
                 min_savings_percent=float(pr_data.get("min_savings_percent", config.processing.min_savings_percent)),
                 enable_gpu_encoding=bool(pr_data.get("enable_gpu_encoding", config.processing.enable_gpu_encoding)),
+                enable_gpu1=bool(pr_data.get("enable_gpu1", config.processing.enable_gpu1)),
+                enable_gpu2=bool(pr_data.get("enable_gpu2", config.processing.enable_gpu2)),
                 gpu_workers=int(pr_data.get("gpu_workers", config.processing.gpu_workers)),
                 enable_cpu_encoding=bool(pr_data.get("enable_cpu_encoding", config.processing.enable_cpu_encoding)),
                 cpu_max_file_size=pr_data.get("cpu_max_file_size", config.processing.cpu_max_file_size),
                 resume=bool(pr_data.get("resume", config.processing.resume)),
+                scan_cache_hours=float(pr_data.get("scan_cache_hours", config.processing.scan_cache_hours)),
                 network_retries=int(pr_data.get("network_retries", config.processing.network_retries)),
                 network_retry_delay=float(pr_data.get("network_retry_delay", config.processing.network_retry_delay)),
                 duration_tolerance=float(pr_data.get("duration_tolerance", config.processing.duration_tolerance)),

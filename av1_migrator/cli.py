@@ -55,9 +55,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sort",
         type=str,
-        choices=["largest_first", "smallest_first"],
+        choices=["largest_first", "smallest_first", "biggest_first"],
         default=None,
         help="Sort queue by file size ('largest_first' or 'smallest_first')",
+    )
+    parser.add_argument(
+        "--biggest-first", "--largest-first",
+        dest="sort",
+        action="store_const",
+        const="largest_first",
+        help="Sort queue to process largest files first",
+    )
+    parser.add_argument(
+        "--smallest-first",
+        dest="sort",
+        action="store_const",
+        const="smallest_first",
+        help="Sort queue to process smallest files first",
     )
     parser.add_argument(
         "--pre-check",
@@ -105,20 +119,71 @@ def parse_args() -> argparse.Namespace:
         help="Hardware CUDA scaling interpolation algorithm (default: bicubic)",
     )
     parser.add_argument(
-        "--no-cpu",
+        "--cpu",
+        dest="enable_cpu",
         action="store_true",
+        default=None,
+        help="Enable concurrent CPU AV1 encoding worker",
+    )
+    parser.add_argument(
+        "--no-cpu",
+        dest="enable_cpu",
+        action="store_false",
         help="Disable concurrent CPU AV1 encoding worker",
+    )
+    parser.add_argument(
+        "--gpu1",
+        dest="enable_gpu1",
+        action="store_true",
+        default=None,
+        help="Enable GPU 1 NVENC encoding worker",
+    )
+    parser.add_argument(
+        "--no-gpu1",
+        dest="enable_gpu1",
+        action="store_false",
+        help="Disable GPU 1 NVENC encoding worker",
+    )
+    parser.add_argument(
+        "--gpu2",
+        dest="enable_gpu2",
+        action="store_true",
+        default=None,
+        help="Enable GPU 2 NVENC encoding worker",
+    )
+    parser.add_argument(
+        "--no-gpu2",
+        dest="enable_gpu2",
+        action="store_false",
+        help="Disable GPU 2 NVENC encoding worker",
+    )
+    parser.add_argument(
+        "--workers",
+        type=str,
+        default=None,
+        help="Select active worker types as comma-separated list (e.g. 'cpu,gpu1,gpu2', 'gpu1,gpu2', 'gpu1', 'cpu')",
     )
     parser.add_argument(
         "--no-gpu",
         action="store_true",
-        help="Disable GPU encoding worker",
+        help="Disable all GPU encoding workers",
     )
     parser.add_argument(
         "--gpu-workers",
         type=int,
         default=None,
         help="Number of concurrent GPU NVENC workers (default: 2)",
+    )
+    parser.add_argument(
+        "--force-scan", "--rescan",
+        action="store_true",
+        help="Force full remote filesystem scan even if last scan was < 24 hours ago",
+    )
+    parser.add_argument(
+        "--scan-cache-hours",
+        type=float,
+        default=None,
+        help="Maximum hours to cache remote scan results before performing fresh scan (default: 24.0)",
     )
     parser.add_argument(
         "--staging-dir",
@@ -172,10 +237,30 @@ def main() -> int:
         config.processing.min_savings_percent = args.min_savings
     if args.interp_algo:
         config.output.cuda_interp_algo = args.interp_algo
-    if args.no_cpu:
-        config.processing.enable_cpu_encoding = False
-    if args.no_gpu:
-        config.processing.enable_gpu_encoding = False
+    if args.scan_cache_hours is not None:
+        config.processing.scan_cache_hours = max(0.0, args.scan_cache_hours)
+
+    # Worker configuration
+    if args.workers is not None:
+        tokens = [t.strip().lower() for t in args.workers.split(",") if t.strip()]
+        config.processing.enable_cpu_encoding = "cpu" in tokens or "all" in tokens
+        config.processing.enable_gpu1 = "gpu1" in tokens or "gpu" in tokens or "all" in tokens
+        config.processing.enable_gpu2 = "gpu2" in tokens or "all" in tokens
+        config.processing.enable_gpu_encoding = config.processing.enable_gpu1 or config.processing.enable_gpu2
+    else:
+        if args.enable_cpu is not None:
+            config.processing.enable_cpu_encoding = args.enable_cpu
+        if args.enable_gpu1 is not None:
+            config.processing.enable_gpu1 = args.enable_gpu1
+        if args.enable_gpu2 is not None:
+            config.processing.enable_gpu2 = args.enable_gpu2
+        if args.no_gpu:
+            config.processing.enable_gpu_encoding = False
+            config.processing.enable_gpu1 = False
+            config.processing.enable_gpu2 = False
+        else:
+            config.processing.enable_gpu_encoding = config.processing.enable_gpu1 or config.processing.enable_gpu2
+
     if args.gpu_workers is not None:
         config.processing.gpu_workers = max(1, args.gpu_workers)
     if args.staging_dir:

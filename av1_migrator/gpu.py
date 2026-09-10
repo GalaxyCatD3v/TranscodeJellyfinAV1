@@ -6,13 +6,59 @@ import shutil
 import subprocess
 import threading
 import time
-from typing import Optional
+from typing import Any, Dict, List, Optional
 from av1_migrator.logger import get_logger
 from av1_migrator.models import GPUStats
 
 
 def is_nvidia_smi_available() -> bool:
     return shutil.which("nvidia-smi") is not None
+
+
+def get_available_gpus() -> List[Dict[str, Any]]:
+    """
+    Returns a list of detected NVIDIA GPUs with index and name.
+    e.g. [{'index': 0, 'name': 'NVIDIA GeForce RTX 4070 Ti'}]
+    """
+    if not is_nvidia_smi_available():
+        return []
+
+    try:
+        proc = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,name",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=3.0,
+            check=False,
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return []
+
+        gpus: List[Dict[str, Any]] = []
+        for line in proc.stdout.strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = [p.strip() for p in line.split(",", 1)]
+            if len(parts) >= 2:
+                try:
+                    idx = int(parts[0])
+                    name = parts[1]
+                    gpus.append({"index": idx, "name": name})
+                except ValueError:
+                    continue
+            elif len(parts) == 1 and parts[0]:
+                gpus.append({"index": len(gpus), "name": parts[0]})
+        return gpus
+    except Exception as e:
+        get_logger().debug(f"Failed to query available GPUs: {e}")
+        return []
 
 
 def fetch_gpu_stats() -> GPUStats:

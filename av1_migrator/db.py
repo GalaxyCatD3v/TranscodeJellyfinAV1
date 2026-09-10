@@ -50,6 +50,12 @@ class MigrationDB:
                         skip_reason TEXT
                     )
                 """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS app_metadata (
+                        key TEXT PRIMARY KEY,
+                        value TEXT
+                    )
+                """)
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON media_files(status);")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_size ON media_files(source_size);")
 
@@ -362,6 +368,28 @@ class MigrationDB:
                 cur = conn.cursor()
                 cur.execute("UPDATE media_files SET status = 'pending', error = NULL, skip_reason = NULL, started_at = NULL, completed_at = NULL WHERE source_path = ?", (norm_src,))
                 return cur.rowcount > 0
+
+    def set_metadata(self, key: str, value: str) -> None:
+        """Sets a key-value pair in app_metadata."""
+        with self._lock:
+            conn = self._get_connection()
+            with conn:
+                conn.execute("INSERT OR REPLACE INTO app_metadata (key, value) VALUES (?, ?)", (str(key), str(value)))
+
+    def get_metadata(self, key: str) -> Optional[str]:
+        """Gets a value from app_metadata by key."""
+        conn = self._get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM app_metadata WHERE key = ?", (str(key),))
+        row = cur.fetchone()
+        return row["value"] if row else None
+
+    def get_pending_files(self) -> List[Dict[str, Any]]:
+        """Retrieves all media files currently in pending status."""
+        conn = self._get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM media_files WHERE status = 'pending'")
+        return [dict(r) for r in cur.fetchall()]
 
     def close(self) -> None:
         if hasattr(self._local, "conn") and self._local.conn is not None:
