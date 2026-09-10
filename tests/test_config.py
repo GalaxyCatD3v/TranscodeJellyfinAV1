@@ -51,9 +51,33 @@ processing:
   pre_encode_check: false
   sample_duration: 15.0
   min_savings_percent: 5.0
+  enable_gpu1: false
+  enable_gpu2: true
+  scan_cache_hours: 12.0
 """, encoding="utf-8")
     config = load_config(cfg_file)
     assert config.processing.keep_smaller is False
     assert config.processing.pre_encode_check is False
     assert config.processing.sample_duration == 15.0
     assert config.processing.min_savings_percent == 5.0
+    assert config.processing.enable_gpu1 is False
+    assert config.processing.enable_gpu2 is True
+    assert config.processing.scan_cache_hours == 12.0
+
+
+def test_cli_worker_and_sort_flags(monkeypatch):
+    from av1_migrator.cli import parse_args
+
+    monkeypatch.setattr("sys.argv", ["prog", "--biggest-first", "--gpu1", "--no-gpu2", "--no-cpu", "--force-scan", "--scan-cache-hours", "48"])
+    args = parse_args()
+    assert args.sort == "largest_first"
+    assert args.enable_gpu1 is True
+    assert args.enable_gpu2 is False
+    assert args.enable_cpu is False
+    assert args.force_scan is True
+    assert args.scan_cache_hours == 48.0
+
+    monkeypatch.setattr("sys.argv", ["prog", "--smallest-first", "--workers", "cpu,gpu1"])
+    args2 = parse_args()
+    assert args2.sort == "smallest_first"
+    assert args2.workers == "cpu,gpu1"
