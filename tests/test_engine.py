@@ -338,3 +338,82 @@ def test_engine_pre_encode_check_skips_bloat(test_env):
         assert db_rec is not None
         assert db_rec["status"] == "skipped"
         assert "predicted bloat" in db_rec["skip_reason"].lower()
+
+
+def test_engine_scan_cache_within_24h_skips_remote_walk(test_env):
+    from datetime import datetime, timedelta
+    config = test_env["config"]
+    db = test_env["db"]
+    m1 = test_env["m1"]
+    m2 = test_env["m2"]
+
+    # Seed DB with last scan 2 hours ago (< 24h) and pending records
+    db.set_metadata("last_scan_time", (datetime.now() - timedelta(hours=2)).isoformat())
+    db.upsert_file(m1, source_size=50000, source_mtime=1.0, status="pending")
+    db.upsert_file(m2, source_size=10000, source_mtime=2.0, status="pending")
+
+    def mock_probe(p, cfg):
+        sz = p.stat().st_size
+        return MediaFile(
+            source=p,
+            size=sz,
+            video_codec="hevc",
+            duration=100.0,
+            hdr=False,
+            output_path=p.parent / f"{p.stem} [AV1 1080p SDR CQ28].mkv",
+            temp_output_path=p.parent / f"{p.stem} [AV1 1080p SDR CQ28].mkv.encoding.mkv",
+            selected_video=VideoStream(index=0, codec_name="hevc", width=3840, height=2160),
+            selected_audio=[AudioStream(index=1, codec_name="truehd", language="eng")],
+            status="pending",
+        )
+
+    with patch("av1_migrator.engine.scan_all_roots") as mock_scan_roots, \
+         patch("av1_migrator.engine.probe_and_populate_media_file", side_effect=mock_probe):
+
+        engine = MigrationEngine(config=config, db=db, dry_run=True, no_ui=True)
+        res = engine.execute()
+
+        # scan_all_roots must NOT have been called because last scan was 2h ago (< 24h)
+        assert mock_scan_roots.call_count == 0
+        assert res["status"] == "dry_run_complete"
+        assert res["queue_count"] == 2
+        # Verify sort order
+        assert engine.queue[0].source == m1
+        assert engine.queue[1].source == m2
+
+
+def test_engine_force_scan_overrides_24h_cache(test_env):
+    from datetime import datetime, timedelta
+    config = test_env["config"]
+    db = test_env["db"]
+    m1 = test_env["m1"]
+    m2 = test_env["m2"]
+
+    # Seed DB with last scan 1 hour ago
+    db.set_metadata("last_scan_time", (datetime.now() - timedelta(hours=1)).isoformat())
+
+    def mock_probe(p, cfg):
+        sz = p.stat().st_size
+        return MediaFile(
+            source=p,
+            size=sz,
+            video_codec="hevc",
+            duration=100.0,
+            hdr=False,
+            output_path=p.parent / f"{p.stem} [AV1 1080p SDR CQ28].mkv",
+            temp_output_path=p.parent / f"{p.stem} [AV1 1080p SDR CQ28].mkv.encoding.mkv",
+            selected_video=VideoStream(index=0, codec_name="hevc", width=3840, height=2160),
+            selected_audio=[AudioStream(index=1, codec_name="truehd", language="eng")],
+            status="pending",
+        )
+
+    from av1_migrator.models import ScanStats
+    with patch("av1_migrator.engine.scan_all_roots", return_value=([m1, m2], ScanStats(files_discovered=2))) as mock_scan_roots, \
+         patch("av1_migrator.engine.probe_and_populate_media_file", side_effect=mock_probe):
+
+        # With force_scan=True, scan_all_roots must be invoked
+        engine = MigrationEngine(config=config, db=db, dry_run=True, force_scan=True, no_ui=True)
+        res = engine.execute()
+
+        assert mock_scan_roots.call_count == 1
+        assert res["queue_count"] == 2

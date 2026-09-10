@@ -24,7 +24,7 @@ from av1_migrator.encoder import (
     is_libsvtav1_available,
     is_scale_cuda_available,
 )
-from av1_migrator.gpu import GPUMonitorThread, is_nvidia_smi_available
+from av1_migrator.gpu import GPUMonitorThread, get_available_gpus, is_nvidia_smi_available
 from av1_migrator.logger import get_logger
 from av1_migrator.models import EncodeProgress, GPUStats, MediaFile, ScanStats, StorageStats
 from av1_migrator.optimizer import evaluate_pre_encode_optimization
@@ -38,6 +38,7 @@ from av1_migrator.progress import (
     MigrationProgressBar,
 )
 from av1_migrator.scanner import is_encoding_temp_file, scan_all_roots
+from av1_migrator.sshfs import SSHFSConfig, is_drive_accessible, mount_sshfs
 from av1_migrator.storage import check_storage_safety, get_path_disk_usage, StorageMonitorThread
 from av1_migrator.utils import find_binary_executable, normalize_filepath, sanitize_filename
 from av1_migrator.validator import validate_converted_file
@@ -55,6 +56,7 @@ class MigrationEngine:
         retry_failed: bool = False,
         no_delete: bool = False,
         no_ui: bool = False,
+        force_scan: bool = False,
     ):
         self.config = config
         self.db = db or MigrationDB(config.database.path)
@@ -65,6 +67,7 @@ class MigrationEngine:
         self.retry_failed = retry_failed
         self.no_delete = no_delete
         self.no_ui = no_ui
+        self.force_scan = force_scan
 
         self.logger = get_logger()
         self.gpu_monitor = GPUMonitorThread(poll_interval=1.0)
@@ -136,17 +139,29 @@ class MigrationEngine:
             all_ok = False
 
         # NVIDIA GPU
-        if is_nvidia_smi_available():
+        gpus = get_available_gpus()
+        if gpus:
+            for g in gpus:
+                checks.append(f"✓ NVIDIA GPU {g['index']}: {g['name']}")
+        elif is_nvidia_smi_available():
             checks.append("✓ NVIDIA GPU (nvidia-smi detected)")
         else:
             checks.append("⚠ NVIDIA GPU (nvidia-smi not found in PATH)")
 
-        # AV1 NVENC
-        gpu_workers_cnt = getattr(self.config.processing, "gpu_workers", 2)
-        if is_av1_nvenc_available(self.config.ffmpeg.executable):
-            checks.append(f"✓ AV1 NVENC encoder available (GPU Workers: {gpu_workers_cnt})")
+        # AV1 NVENC & Active GPU Workers
+        gpu_name_0 = gpus[0]["name"] if gpus else "NVIDIA NVENC"
+        gpu_name_1 = gpus[1]["name"] if len(gpus) > 1 else gpu_name_0
+        active_gpu_workers = []
+        if self.config.processing.enable_gpu_encoding and is_av1_nvenc_available(self.config.ffmpeg.executable):
+            if getattr(self.config.processing, "enable_gpu1", True):
+                active_gpu_workers.append(f"GPU 1 ({gpu_name_0})")
+            if getattr(self.config.processing, "enable_gpu2", True):
+                active_gpu_workers.append(f"GPU 2 ({gpu_name_1})")
+
+        if active_gpu_workers:
+            checks.append(f"✓ AV1 NVENC encoder available (Active Workers: {', '.join(active_gpu_workers)})")
         else:
-            checks.append("⚠ AV1 NVENC encoder not found in FFmpeg (GPU encoding disabled)")
+            checks.append("⚠ AV1 NVENC encoder not found or disabled")
 
         # CUDA scaling
         interp = getattr(self.config.output, "cuda_interp_algo", "bicubic")
@@ -157,7 +172,28 @@ class MigrationEngine:
 
         # CPU AV1 Encoder
         cpu_codec = get_available_cpu_av1_encoder(self.config.ffmpeg.executable)
-        checks.append(f"✓ CPU AV1 encoder available ({cpu_codec})")
+        if getattr(self.config.processing, "enable_cpu_encoding", True):
+            checks.append(f"✓ CPU AV1 encoder available (Active Worker: CPU - {cpu_codec})")
+        else:
+            checks.append(f"✓ CPU AV1 encoder available ({cpu_codec}, disabled in options)")
+
+        # Scan Cache Status (24-hour check)
+        last_scan = self.db.get_metadata("last_scan_time")
+        if last_scan:
+            try:
+                last_dt = datetime.fromisoformat(last_scan)
+                elapsed_h = (datetime.now() - last_dt).total_seconds() / 3600.0
+                cache_h = getattr(self.config.processing, "scan_cache_hours", 24.0)
+                if self.force_scan:
+                    checks.append(f"✓ Scan cache: Last scan was {elapsed_h:.1f}h ago (force scan requested, full remote walk will run)")
+                elif elapsed_h < cache_h:
+                    checks.append(f"✓ Scan cache: Last scan was {elapsed_h:.1f}h ago (< {cache_h:.0f}h, remote scan will be skipped)")
+                else:
+                    checks.append(f"✓ Scan cache: Last scan was {elapsed_h:.1f}h ago (>= {cache_h:.0f}h, fresh remote scan will run)")
+            except Exception:
+                checks.append("✓ Scan cache: Initial run (full remote scan scheduled)")
+        else:
+            checks.append("✓ Scan cache: Initial run (full remote scan scheduled)")
 
         # Local Staging Directory (e.g. F:\JellyfinTranscode)
         if self.config.storage.enable_local_staging:
@@ -169,7 +205,18 @@ class MigrationEngine:
             except Exception as e:
                 checks.append(f"⚠ Local staging directory inaccessible ({stg_dir}): {e}")
 
-        # Media roots check
+        # Media roots check (with SSHFS auto-mount if remote drive is unmounted)
+        inaccessible_roots = [r for r in self.config.media_roots if not Path(r).exists()]
+        if inaccessible_roots:
+            ssh_cfg = SSHFSConfig.from_env()
+            if ssh_cfg.auto_mount and not is_drive_accessible(ssh_cfg.mount_drive) and Path(ssh_cfg.sshfs_exe).is_file():
+                self.logger.info(f"Media roots inaccessible. Attempting auto-mount of SSHFS {ssh_cfg.mount_drive}...")
+                ok_mount, msg_mount, _ = mount_sshfs(ssh_cfg)
+                if ok_mount:
+                    checks.append(f"✓ Auto-mounted SSHFS {ssh_cfg.mount_drive} ({ssh_cfg.user}@{ssh_cfg.host}:{ssh_cfg.remote_path})")
+                else:
+                    checks.append(f"⚠ SSHFS auto-mount failed: {msg_mount}")
+
         for r in self.config.media_roots:
             p = Path(r)
             if p.exists():
@@ -305,6 +352,54 @@ class MigrationEngine:
         if self.retry_failed:
             reset_cnt = self.db.reset_failed()
             self.logger.info(f"Reset {reset_cnt} failed/aborted files back to pending")
+
+        # 24-hour scan cache check: skip remote filesystem walk if scanned recently
+        if not self.force_scan and not self.single_file:
+            last_scan_str = self.db.get_metadata("last_scan_time")
+            if last_scan_str:
+                try:
+                    last_scan_dt = datetime.fromisoformat(last_scan_str)
+                    elapsed_h = (datetime.now() - last_scan_dt).total_seconds() / 3600.0
+                    cache_h = getattr(self.config.processing, "scan_cache_hours", 24.0)
+                    if elapsed_h < cache_h:
+                        self.logger.info(
+                            f"Last remote filesystem scan was {elapsed_h:.1f} hours ago (< {cache_h:.0f}h). "
+                            f"Skipping remote directory scan and loading pending files from database cache."
+                        )
+                        MigrationProgressBar.write(
+                            f"Last scan was {elapsed_h:.1f}h ago (< {cache_h:.0f}h). Skipping remote filesystem walk and loading from database cache."
+                        )
+                        pending_rows = self.db.get_pending_files()
+                        if pending_rows:
+                            is_largest_first = self.config.processing.sort in ("largest_first", "biggest_first", "desc", "largest")
+                            sort_order_label = "largest files first" if is_largest_first else "smallest files first"
+                            self.logger.info(f"Loaded {len(pending_rows)} pending candidate files from database. Sorting by size ({sort_order_label})...")
+                            pending_rows.sort(key=lambda r: r["source_size"], reverse=is_largest_first)
+                            if self.limit:
+                                pending_rows = pending_rows[:self.limit]
+
+                            media_files_to_process: List[MediaFile] = []
+                            for r in pending_rows:
+                                p = Path(r["source_path"])
+                                if not p.is_file():
+                                    continue
+                                mf = probe_and_populate_media_file(p, self.config)
+                                if mf.status == "failed":
+                                    scan_stats.probe_errors += 1
+                                    self.failed_count += 1
+                                elif mf.status == "skipped":
+                                    scan_stats.files_skipped += 1
+                                    self.skipped_count += 1
+                                else:
+                                    mf.status = "pending"
+                                    scan_stats.eligible_files += 1
+                                    media_files_to_process.append(mf)
+
+                            self.queue = media_files_to_process
+                            self.total_files_count = len(media_files_to_process)
+                            return media_files_to_process, scan_stats
+                except Exception as e:
+                    self.logger.warning(f"Error checking scan cache timestamp: {e}. Falling back to full remote scan.")
 
         if self.single_file:
             target_path = Path(self.single_file).resolve()
@@ -539,6 +634,9 @@ class MigrationEngine:
                 probe_prog.finish()
             except Exception:
                 pass
+
+        if not self.single_file:
+            self.db.set_metadata("last_scan_time", datetime.now().isoformat())
 
         self.queue = media_files_to_process
         self.total_files_count = len(media_files_to_process)
@@ -1021,17 +1119,33 @@ class MigrationEngine:
         overall_prog.start()
         self._overall_pbar = overall_prog
 
+        gpus = get_available_gpus()
+        gpu1_name = gpus[0]["name"] if gpus else "NVIDIA NVENC"
+        gpu2_name = gpus[1]["name"] if len(gpus) > 1 else (gpus[0]["name"] if gpus else "NVIDIA NVENC")
+
         gpu_active = self.config.processing.enable_gpu_encoding and is_av1_nvenc_available(self.config.ffmpeg.executable)
         cpu_active = self.config.processing.enable_cpu_encoding
-        num_gpu_workers = max(1, getattr(self.config.processing, "gpu_workers", 2)) if gpu_active else 0
+
+        gpu_workers_to_run: List[str] = []
+        if gpu_active:
+            enable_g1 = getattr(self.config.processing, "enable_gpu1", True)
+            enable_g2 = getattr(self.config.processing, "enable_gpu2", True)
+            max_gpu_workers = getattr(self.config.processing, "gpu_workers", 2)
+
+            candidates: List[str] = []
+            if enable_g1:
+                candidates.append(f"GPU 1 ({gpu1_name})")
+            if enable_g2 and (max_gpu_workers > 1 or not enable_g1):
+                candidates.append(f"GPU 2 ({gpu2_name})")
+
+            gpu_workers_to_run = candidates[:max_gpu_workers]
 
         pbars: List[MigrationProgressBar] = []
         threads: List[threading.Thread] = []
         cur_pos = 1
 
-        if num_gpu_workers > 0:
-            for g_idx in range(1, num_gpu_workers + 1):
-                w_name = f"GPU {g_idx}" if num_gpu_workers > 1 else "GPU"
+        if gpu_workers_to_run:
+            for w_name in gpu_workers_to_run:
                 g_pbar = create_worker_progressbar(w_name, position=cur_pos)
                 g_pbar.start()
                 pbars.append(g_pbar)
@@ -1040,7 +1154,7 @@ class MigrationEngine:
                 t_gpu = threading.Thread(
                     target=self._worker_loop,
                     args=(w_name, g_pbar),
-                    name=f"{w_name.replace(' ', '-')}-Worker",
+                    name=f"{w_name.split(' ')[0]}-Worker",
                     daemon=True,
                 )
                 threads.append(t_gpu)

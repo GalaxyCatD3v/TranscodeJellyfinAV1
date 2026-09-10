@@ -12,6 +12,7 @@ from av1_migrator.db import MigrationDB
 from av1_migrator.engine import MigrationEngine
 from av1_migrator.logger import setup_logger
 from av1_migrator.progress import MigrationProgressBar
+from av1_migrator.sshfs import SSHFSConfig, is_drive_accessible, mount_sshfs, unmount_sshfs
 
 
 def parse_args() -> argparse.Namespace:
@@ -207,6 +208,27 @@ def parse_args() -> argparse.Namespace:
         help="Disable interactive Rich live dashboard (logs only)",
     )
     parser.add_argument(
+        "--env",
+        type=str,
+        default=".env",
+        help="Path to .env configuration file (default: .env)",
+    )
+    parser.add_argument(
+        "--mount-sshfs",
+        action="store_true",
+        help="Mount the remote SSHFS filesystem using .env configuration",
+    )
+    parser.add_argument(
+        "--unmount-sshfs",
+        action="store_true",
+        help="Unmount the remote SSHFS filesystem",
+    )
+    parser.add_argument(
+        "--check-sshfs",
+        action="store_true",
+        help="Check if the remote SSHFS filesystem is mounted and accessible",
+    )
+    parser.add_argument(
         "--preflight-only",
         action="store_true",
         help="Run system pre-flight checks and exit",
@@ -224,6 +246,28 @@ def main() -> int:
         pass
 
     args = parse_args()
+
+    # Handle SSHFS standalone operations
+    if args.check_sshfs:
+        ssh_cfg = SSHFSConfig.from_env(args.env)
+        is_up = is_drive_accessible(ssh_cfg.mount_drive)
+        status_msg = f"SSHFS Drive {ssh_cfg.mount_drive} ({ssh_cfg.user}@{ssh_cfg.host}:{ssh_cfg.remote_path}) is {'ACCESSIBLE' if is_up else 'NOT ACCESSIBLE / UNMOUNTED'}."
+        MigrationProgressBar.write(status_msg)
+        return 0 if is_up else 1
+
+    if args.unmount_sshfs:
+        ssh_cfg = SSHFSConfig.from_env(args.env)
+        ok, msg = unmount_sshfs(ssh_cfg.mount_drive)
+        MigrationProgressBar.write(msg)
+        return 0 if ok else 1
+
+    if args.mount_sshfs:
+        ssh_cfg = SSHFSConfig.from_env(args.env)
+        MigrationProgressBar.write(f"Mounting SSHFS: {ssh_cfg.user}@{ssh_cfg.host}:{ssh_cfg.remote_path} -> {ssh_cfg.mount_drive}")
+        ok, msg, _ = mount_sshfs(ssh_cfg, env_path=args.env)
+        MigrationProgressBar.write(msg)
+        if not ok:
+            return 1
 
     # Load configuration
     config = load_config(args.config)
@@ -307,6 +351,7 @@ def main() -> int:
         retry_failed=args.retry_failed,
         no_delete=args.no_delete,
         no_ui=args.no_ui,
+        force_scan=args.force_scan,
     )
 
     if args.preflight_only:

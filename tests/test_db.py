@@ -148,3 +148,26 @@ def test_db_path_normalization_and_output_path_saving(tmp_path):
     assert row["status"] == "completed"
     assert row["output_path"] is not None
     assert row["output_bytes"] == 50000
+
+
+def test_db_metadata_and_pending_queries(tmp_path):
+    db_file = tmp_path / "test_meta.db"
+    db = MigrationDB(db_file)
+
+    # Metadata get/set
+    assert db.get_metadata("last_scan_time") is None
+    db.set_metadata("last_scan_time", "2026-09-09T20:00:00")
+    assert db.get_metadata("last_scan_time") == "2026-09-09T20:00:00"
+
+    # Upsert pending and completed files
+    p1 = tmp_path / "Pending1.mkv"
+    p2 = tmp_path / "Pending2.mkv"
+    c1 = tmp_path / "Completed1.mkv"
+
+    db.upsert_file(p1, source_size=2000, source_mtime=1.0, status="pending")
+    db.upsert_file(p2, source_size=4000, source_mtime=2.0, status="pending")
+    db.upsert_file(c1, source_size=1000, source_mtime=3.0, status="completed")
+
+    pending = db.get_pending_files()
+    assert len(pending) == 2
+    assert {r["source_path"] for r in pending} == {str(p1), str(p2)}
