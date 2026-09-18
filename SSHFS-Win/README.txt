@@ -1,0 +1,1 @@
+Put this in C:\Program Files\SSHFS-Win
