@@ -183,7 +183,7 @@ def test_migration_engine_upload_failure_5_retries_and_z_staging(tmp_path, monke
     orig_copy2 = shutil.copy2
 
     def fake_copy2(src, dst):
-        if "remote_u" in str(dst) or "test_movie" in str(dst) and not str(dst).startswith(str(f_transcode)):
+        if "remote_u" in str(dst):
             upload_attempts.append(1)
             raise OSError("WinError 1450: Insufficient system resources or SSHFS pipe broken")
         return orig_copy2(src, dst)
@@ -214,3 +214,88 @@ def test_migration_engine_upload_failure_5_retries_and_z_staging(tmp_path, monke
     z_records = engine.manual_staging_mgr.db.get_staged_files()
     assert len(z_records) == 1
     assert "Failed 5 SSHFS" in z_records[0]["notes"]
+
+
+def test_migration_engine_upload_succeeds_on_retry(tmp_path, monkeypatch):
+    # Setup directories
+    f_drive_db = tmp_path / "migration.db"
+    z_staging = tmp_path / "z_staging"
+    z_db = tmp_path / "z_manual.db"
+    f_transcode = tmp_path / "f_transcode"
+
+    config = AppConfig()
+    config.database.path = str(f_drive_db)
+    config.storage.local_staging_dir = str(f_transcode)
+    config.storage.minimum_free_space = "1KB"
+    config.storage.safety_margin = "1KB"
+    config.manual_staging.staging_dir = str(z_staging)
+    config.manual_staging.db_path = str(z_db)
+    config.sshfs.max_retries = 5
+    config.sshfs.reconnect_delay = 0.01
+    config.processing.pre_encode_check = False
+    config.processing.delete_original = True
+
+    db = MigrationDB(f_drive_db)
+    engine = MigrationEngine(config=config, db=db, no_ui=True)
+
+    src_file = tmp_path / "test_movie_recover.mkv"
+    src_file.write_bytes(b"0" * 20000)
+
+    remote_out = tmp_path / "remote_u" / "test_movie_recover.mkv"
+    mf = MediaFile(
+        source=src_file,
+        output_path=remote_out,
+        temp_output_path=tmp_path / "remote_u" / "test_movie_recover.mkv.encoding.mkv",
+        size=src_file.stat().st_size,
+        status="pending",
+    )
+    db.upsert_file(source_path=mf.source, source_size=mf.size, source_mtime=123456.0)
+
+    # Mock SSHFSManager reconnect
+    reconnect_counts = []
+    monkeypatch.setattr(engine.sshfs_manager, "reconnect", lambda: reconnect_counts.append(1) or True)
+
+    class MockEncoder:
+        def __init__(self, media_file, config, on_progress=None, encoder_type="gpu", input_path=None, output_path=None):
+            self.media_file = media_file
+            self.output_path = output_path or media_file.temp_output_path
+
+        def run(self):
+            self.output_path.parent.mkdir(parents=True, exist_ok=True)
+            self.output_path.write_bytes(b"1" * 8000)
+            return True, "Encode finished"
+
+        def abort(self, reason=""):
+            pass
+
+    # Fail on first upload attempt, succeed on second attempt
+    attempts = [0]
+    orig_copy2 = shutil.copy2
+
+    def fake_copy2_recover(src, dst):
+        if "remote_u" in str(dst):
+            attempts[0] += 1
+            if attempts[0] == 1:
+                raise OSError("Connection dropped")
+        return orig_copy2(src, dst)
+
+    monkeypatch.setattr("shutil.copy2", fake_copy2_recover)
+
+    with patch("av1_migrator.engine.FFmpegEncoder", MockEncoder), \
+         patch("av1_migrator.engine.validate_converted_file", return_value=(True, "OK", {})), \
+         patch("av1_migrator.engine.check_storage_safety", return_value=(True, "OK", MagicMock(free_bytes=10**12))):
+
+        pbar_mock = MagicMock()
+        engine._process_media_file(
+            media_file=mf,
+            worker_pbar=pbar_mock,
+            worker_type="GPU Worker 1",
+        )
+
+    # Verify status in DB is completed
+    db_row = db.get_file(mf.source)
+    assert db_row["status"] == "completed"
+    assert attempts[0] == 2
+    assert len(reconnect_counts) == 1
+    assert remote_out.exists()
+    assert not src_file.exists()  # Original safely deleted on completion
