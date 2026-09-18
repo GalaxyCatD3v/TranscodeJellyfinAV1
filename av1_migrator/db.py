@@ -12,15 +12,30 @@ from av1_migrator.utils import normalize_filepath
 
 
 class MigrationDB:
-    def __init__(self, db_path: str | Path = "migration.db"):
+    def __init__(self, db_path: str | Path = "F:\\JellyfinTranscode\\migration.db"):
         self.db_path = str(db_path)
         self._local = threading.local()
         self._lock = threading.Lock()
+        p = Path(self.db_path)
+        try:
+            if p.parent and not p.parent.exists():
+                p.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            # If specified path/drive (e.g. F:\) is not available in environment, fallback to local file
+            try:
+                sqlite3.connect(self.db_path, timeout=1.0).close()
+            except Exception:
+                self.db_path = "migration.db"
         self.init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
         if not hasattr(self._local, "conn") or self._local.conn is None:
-            conn = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False)
+            try:
+                conn = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False)
+            except Exception:
+                # Fallback to local DB if drive or path is inaccessible
+                self.db_path = "migration.db"
+                conn = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False)
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA synchronous=NORMAL;")
@@ -39,15 +54,25 @@ class MigrationDB:
                         source_mtime REAL NOT NULL,
                         output_path TEXT,
                         status TEXT NOT NULL DEFAULT 'pending',
+                        progress REAL DEFAULT 0.0,
+                        fps REAL DEFAULT 0.0,
+                        speed REAL DEFAULT 0.0,
+                        eta TEXT,
+                        worker TEXT,
                         started_at TEXT,
                         completed_at TEXT,
                         source_bytes INTEGER,
                         output_bytes INTEGER,
+                        saved_bytes INTEGER,
+                        savings_percent REAL,
                         duration REAL,
                         source_codec TEXT,
+                        target_codec TEXT DEFAULT 'av1',
+                        resolution TEXT,
                         hdr INTEGER DEFAULT 0,
                         error TEXT,
-                        skip_reason TEXT
+                        skip_reason TEXT,
+                        last_updated TEXT
                     )
                 """)
                 conn.execute("""
@@ -58,6 +83,30 @@ class MigrationDB:
                 """)
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON media_files(status);")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_size ON media_files(source_size);")
+
+                # Schema migration for existing tables
+                cur = conn.cursor()
+                cur.execute("PRAGMA table_info(media_files);")
+                existing_cols = {row[1] for row in cur.fetchall()}
+
+                new_cols = [
+                    ("progress", "REAL DEFAULT 0.0"),
+                    ("fps", "REAL DEFAULT 0.0"),
+                    ("speed", "REAL DEFAULT 0.0"),
+                    ("eta", "TEXT"),
+                    ("worker", "TEXT"),
+                    ("saved_bytes", "INTEGER"),
+                    ("savings_percent", "REAL"),
+                    ("target_codec", "TEXT DEFAULT 'av1'"),
+                    ("resolution", "TEXT"),
+                    ("last_updated", "TEXT"),
+                ]
+                for col_name, col_type in new_cols:
+                    if col_name not in existing_cols:
+                        try:
+                            conn.execute(f"ALTER TABLE media_files ADD COLUMN {col_name} {col_type};")
+                        except Exception:
+                            pass
 
     def get_file(self, source_path: str | Path) -> Optional[Dict[str, Any]]:
         conn = self._get_connection()
@@ -75,18 +124,23 @@ class MigrationDB:
         output_path: Optional[str | Path] = None,
         status: str = "pending",
         source_codec: Optional[str] = None,
+        target_codec: Optional[str] = "av1",
+        resolution: Optional[str] = None,
         duration: Optional[float] = None,
         hdr: bool = False,
         skip_reason: Optional[str] = None,
         error: Optional[str] = None,
         source_bytes: Optional[int] = None,
         output_bytes: Optional[int] = None,
+        progress: Optional[float] = None,
+        worker: Optional[str] = None,
     ) -> None:
         norm_src = normalize_filepath(source_path)
         norm_out = normalize_filepath(output_path) if output_path else None
         with self._lock:
             conn = self._get_connection()
             with conn:
+                now_str = datetime.now().isoformat()
                 # Check if exists
                 cur = conn.cursor()
                 cur.execute("SELECT source_size, source_mtime, status FROM media_files WHERE source_path = ?", (norm_src,))
@@ -98,12 +152,16 @@ class MigrationDB:
                         conn.execute("""
                             UPDATE media_files
                             SET source_size = ?, source_mtime = ?, output_path = ?, status = 'pending',
-                                source_codec = ?, duration = ?, hdr = ?, error = NULL, skip_reason = NULL,
-                                started_at = NULL, completed_at = NULL, source_bytes = NULL, output_bytes = NULL
+                                progress = 0.0, fps = 0.0, speed = 0.0, eta = NULL, worker = NULL,
+                                source_codec = ?, target_codec = ?, resolution = ?, duration = ?, hdr = ?,
+                                error = NULL, skip_reason = NULL, started_at = NULL, completed_at = NULL,
+                                source_bytes = NULL, output_bytes = NULL, saved_bytes = NULL, savings_percent = NULL,
+                                last_updated = ?
                             WHERE source_path = ?
                         """, (
                             source_size, source_mtime, norm_out,
-                            source_codec, duration, 1 if hdr else 0, norm_src
+                            source_codec, target_codec or "av1", resolution, duration, 1 if hdr else 0,
+                            now_str, norm_src
                         ))
                     else:
                         # Update metadata without overwriting completed status if already completed
@@ -111,29 +169,74 @@ class MigrationDB:
                             UPDATE media_files
                             SET output_path = COALESCE(?, output_path),
                                 source_codec = COALESCE(?, source_codec),
+                                target_codec = COALESCE(?, target_codec, 'av1'),
+                                resolution = COALESCE(?, resolution),
                                 duration = COALESCE(?, duration),
                                 hdr = ?,
                                 skip_reason = COALESCE(?, skip_reason),
                                 error = COALESCE(?, error),
                                 source_bytes = COALESCE(?, source_bytes),
-                                output_bytes = COALESCE(?, output_bytes)
+                                output_bytes = COALESCE(?, output_bytes),
+                                progress = COALESCE(?, progress),
+                                worker = COALESCE(?, worker),
+                                last_updated = ?
                             WHERE source_path = ?
                         """, (
                             norm_out,
-                            source_codec, duration, 1 if hdr else 0,
-                            skip_reason, error, source_bytes, output_bytes, norm_src
+                            source_codec, target_codec, resolution, duration, 1 if hdr else 0,
+                            skip_reason, error, source_bytes, output_bytes, progress, worker,
+                            now_str, norm_src
                         ))
                 else:
                     conn.execute("""
                         INSERT INTO media_files (
                             source_path, source_size, source_mtime, output_path, status,
-                            source_codec, duration, hdr, skip_reason, error, source_bytes, output_bytes
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            progress, worker, source_codec, target_codec, resolution, duration,
+                            hdr, skip_reason, error, source_bytes, output_bytes, last_updated
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         norm_src, source_size, source_mtime,
                         norm_out, status,
-                        source_codec, duration, 1 if hdr else 0, skip_reason, error, source_bytes, output_bytes
+                        progress or 0.0, worker,
+                        source_codec, target_codec or "av1", resolution, duration,
+                        1 if hdr else 0, skip_reason, error, source_bytes, output_bytes, now_str
                     ))
+
+    def update_progress(
+        self,
+        source_path: str | Path,
+        progress: float,
+        fps: Optional[float] = None,
+        speed: Optional[float] = None,
+        eta: Optional[str] = None,
+        worker: Optional[str] = None,
+        output_bytes: Optional[int] = None,
+    ) -> None:
+        norm_src = normalize_filepath(source_path)
+        with self._lock:
+            conn = self._get_connection()
+            with conn:
+                now_str = datetime.now().isoformat()
+                updates = ["progress = ?", "last_updated = ?"]
+                params: List[Any] = [progress, now_str]
+                if fps is not None:
+                    updates.append("fps = ?")
+                    params.append(fps)
+                if speed is not None:
+                    updates.append("speed = ?")
+                    params.append(speed)
+                if eta is not None:
+                    updates.append("eta = ?")
+                    params.append(eta)
+                if worker is not None:
+                    updates.append("worker = ?")
+                    params.append(worker)
+                if output_bytes is not None:
+                    updates.append("output_bytes = ?")
+                    params.append(output_bytes)
+                params.append(norm_src)
+                query = f"UPDATE media_files SET {', '.join(updates)} WHERE source_path = ?"
+                conn.execute(query, params)
 
     def update_status(
         self,
@@ -146,6 +249,8 @@ class MigrationDB:
         output_bytes: Optional[int] = None,
         started_at: Optional[str] = None,
         completed_at: Optional[str] = None,
+        progress: Optional[float] = None,
+        worker: Optional[str] = None,
     ) -> None:
         norm_src = normalize_filepath(source_path)
         norm_out = normalize_filepath(output_path) if output_path is not None else None
@@ -153,8 +258,8 @@ class MigrationDB:
             conn = self._get_connection()
             with conn:
                 now_str = datetime.now().isoformat()
-                updates = ["status = ?"]
-                params: List[Any] = [status]
+                updates = ["status = ?", "last_updated = ?"]
+                params: List[Any] = [status, now_str]
                 
                 if norm_out is not None:
                     updates.append("output_path = ?")
@@ -165,16 +270,39 @@ class MigrationDB:
                 if skip_reason is not None:
                     updates.append("skip_reason = ?")
                     params.append(skip_reason)
+                if worker is not None:
+                    updates.append("worker = ?")
+                    params.append(worker)
                 if source_bytes is not None:
                     updates.append("source_bytes = ?")
                     params.append(source_bytes)
                 if output_bytes is not None:
                     updates.append("output_bytes = ?")
                     params.append(output_bytes)
+                
+                # Space savings calculation when both sizes are known
+                if source_bytes is not None and output_bytes is not None:
+                    saved = max(0, source_bytes - output_bytes)
+                    pct = ((source_bytes - output_bytes) / source_bytes * 100.0) if source_bytes > 0 else 0.0
+                    updates.append("saved_bytes = ?")
+                    params.append(saved)
+                    updates.append("savings_percent = ?")
+                    params.append(pct)
+
+                if progress is not None:
+                    updates.append("progress = ?")
+                    params.append(progress)
+                elif status == "completed":
+                    updates.append("progress = ?")
+                    params.append(100.0)
+                elif status in ("pending", "staging"):
+                    updates.append("progress = ?")
+                    params.append(0.0)
+
                 if started_at is not None:
                     updates.append("started_at = ?")
                     params.append(started_at)
-                elif status == "encoding":
+                elif status in ("encoding", "staging"):
                     updates.append("started_at = ?")
                     params.append(now_str)
                 if completed_at is not None:

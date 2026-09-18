@@ -84,6 +84,7 @@ class MigrationEngine:
         self.encoders_lock = threading.Lock()
         self.monitors_lock = threading.Lock()
         self.staged_lock = threading.Lock()
+        self.sshfs_stream_lock = threading.Lock()  # Guarantees strictly 1 active SSHFS stream at a time
 
         self.active_encoder: Optional[FFmpegEncoder] = None
         self.active_media_file: Optional[MediaFile] = None
@@ -544,6 +545,7 @@ class MigrationEngine:
                 # Candidate is eligible for conversion!
                 scan_stats.eligible_files += 1
                 mf.status = "pending"
+                res_str = f"{mf.width}x{mf.height}" if (mf.width and mf.height) else None
                 self.db.upsert_file(
                     source_path=p,
                     source_size=file_size,
@@ -551,6 +553,8 @@ class MigrationEngine:
                     output_path=mf.output_path,
                     status="pending",
                     source_codec=mf.video_codec,
+                    target_codec="av1",
+                    resolution=res_str,
                     duration=mf.duration,
                     hdr=mf.hdr,
                 )

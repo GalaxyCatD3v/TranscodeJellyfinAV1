@@ -135,9 +135,9 @@ class ProcessingConfig:
     min_savings_percent: float = 0.0  # Minimum % space savings required to proceed (0.0 = must not bloat)
     enable_gpu_encoding: bool = True
     enable_gpu1: bool = True  # Enable GPU 1 NVENC worker
-    enable_gpu2: bool = True  # Enable GPU 2 NVENC worker
-    gpu_workers: int = 2  # Number of concurrent GPU workers (default: 2 to saturate dual NVENC engines)
-    enable_cpu_encoding: bool = True
+    enable_gpu2: bool = False  # Disable GPU 2 worker by default (single GPU card mode)
+    gpu_workers: int = 1  # Number of concurrent GPU workers (default: 1 for single GPU card)
+    enable_cpu_encoding: bool = False
     cpu_max_file_size: Optional[str] = None
     resume: bool = True
     scan_cache_hours: float = 6.0  # Skip remote filesystem walk/probe if last scan was < 6h ago
@@ -164,7 +164,7 @@ class UIConfig:
 
 @dataclass
 class DatabaseConfig:
-    path: str = "migration.db"
+    path: str = "F:\\JellyfinTranscode\\migration.db"
 
 
 @dataclass

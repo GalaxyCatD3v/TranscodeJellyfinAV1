@@ -63,9 +63,9 @@ processing:
   min_savings_percent: 0.0        # Minimum % savings required to transcode (0.0 = must not bloat)
   enable_gpu_encoding: true       # Use NVIDIA NVENC GPU encoding
   enable_gpu1: true               # Use GPU 1 NVENC worker
-  enable_gpu2: true               # Use GPU 2 NVENC worker
-  gpu_workers: 2                  # Total concurrent GPU workers (default: 2)
-  enable_cpu_encoding: false       # Use concurrent CPU AV1 worker alongside GPU
+  enable_gpu2: false              # Disable secondary GPU worker (single GPU card mode)
+  gpu_workers: 1                  # Total concurrent GPU workers (1 for single GPU card)
+  enable_cpu_encoding: false      # Use concurrent CPU AV1 worker alongside GPU
   resume: false
   scan_cache_hours: 6.0           # Skip remote filesystem scan/probe if last scan was < 6 hours ago
   network_retries: 6
@@ -83,7 +83,7 @@ ui:
   refresh_rate: 1.0
 
 database:
-  path: "migration.db"
+  path: "F:\\JellyfinTranscode\\migration.db"
 
 logging:
   directory: "logs"
