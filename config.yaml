@@ -62,7 +62,7 @@ processing:
   stop_on_bloat: true             # Stop transcode immediately during encoding if output exceeds max allowed size
   av1_size_allowance: "1GB"       # Allow AV1 output to be up to 1GB larger than input due to AV1 preference
   pre_encode_check: true          # Pre-encode sample analysis to predict space savings & prevent wasted encoding
-  sample_duration: 30.0           # Seconds of representative sample clip to test transcode
+  sample_duration: 150.0           # Seconds of representative sample clip to test transcode
   min_savings_percent: 0.0        # Minimum % savings required to transcode (0.0 = must not bloat)
   enable_gpu_encoding: true       # Use NVIDIA NVENC GPU encoding
   enable_gpu1: true               # Use GPU 1 NVENC worker
@@ -71,7 +71,7 @@ processing:
   gpu_device_id: 0                # Dedicated NVIDIA GPU card index (dedicated card not CPU iGPU)
   enable_cpu_encoding: false      # Use concurrent CPU AV1 worker alongside GPU
   resume: false
-  scan_cache_hours: 6.0           # Skip remote filesystem scan/probe if last scan was < 6 hours ago
+  scan_cache_hours: 24.0           # Skip remote filesystem scan/probe if last scan was < 6 hours ago
   network_retries: 6
   network_retry_delay: 60.0
   duration_tolerance: 5.0
