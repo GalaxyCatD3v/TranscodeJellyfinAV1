@@ -542,10 +542,13 @@ class MigrationEngine:
                         except Exception as e:
                             self.logger.error(f"Could not remove invalid existing file {mf.output_path}: {e}")
 
+                w = mf.width or (mf.selected_video.width if mf.selected_video else None)
+                h = mf.height or (mf.selected_video.height if mf.selected_video else None)
+                res_str = f"{w}x{h}" if (w and h) else None
+
                 # Candidate is eligible for conversion!
                 scan_stats.eligible_files += 1
                 mf.status = "pending"
-                res_str = f"{mf.width}x{mf.height}" if (mf.width and mf.height) else None
                 self.db.upsert_file(
                     source_path=p,
                     source_size=file_size,
