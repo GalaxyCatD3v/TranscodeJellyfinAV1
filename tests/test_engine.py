@@ -187,6 +187,7 @@ def test_engine_startup_recovery(test_env):
 
 def test_engine_bloated_encode_preserves_smaller_original(test_env):
     config = test_env["config"]
+    config.processing.av1_size_allowance = "0B"
     db = test_env["db"]
     m2 = test_env["m2"]
     original_size = m2.stat().st_size  # 10000 bytes
@@ -207,7 +208,7 @@ def test_engine_bloated_encode_preserves_smaller_original(test_env):
         )
 
     class MockBloatedEncoder:
-        def __init__(self, media_file, config, on_progress=None):
+        def __init__(self, media_file, config, on_progress=None, **kwargs):
             self.media_file = media_file
 
         def run(self):
@@ -246,8 +247,58 @@ def test_engine_bloated_encode_preserves_smaller_original(test_env):
         assert "bloated" in db_rec["skip_reason"].lower()
 
 
+def test_engine_av1_preference_allows_sub_gig_increase(test_env):
+    config = test_env["config"]
+    config.processing.av1_size_allowance = "1GB"
+    config.processing.delete_original = False
+    db = test_env["db"]
+    m2 = test_env["m2"]
+    original_size = m2.stat().st_size  # 10000 bytes
+
+    def mock_probe(p, cfg):
+        sz = p.stat().st_size
+        return MediaFile(
+            source=p,
+            size=sz,
+            video_codec="hevc",
+            duration=100.0,
+            hdr=False,
+            output_path=p.parent / f"{p.stem} [AV1 1080p SDR CQ28].mkv",
+            temp_output_path=p.parent / f"{p.stem} [AV1 1080p SDR CQ28].mkv.encoding.mkv",
+            selected_video=VideoStream(index=0, codec_name="hevc", width=3840, height=2160),
+            selected_audio=[AudioStream(index=1, codec_name="truehd", language="eng")],
+            status="pending",
+        )
+
+    class MockSubGigBloatEncoder:
+        def __init__(self, media_file, config, on_progress=None, **kwargs):
+            self.media_file = media_file
+
+        def run(self):
+            # Output is 25000 bytes (15000 bytes > source 10000 bytes, which is < 1GB)
+            self.media_file.temp_output_path.write_bytes(b"X" * 25000)
+            return True, "Encode completed"
+
+        def abort(self, reason=""):
+            pass
+
+    with patch("av1_migrator.engine.probe_and_populate_media_file", side_effect=mock_probe), \
+         patch("av1_migrator.engine.FFmpegEncoder", MockSubGigBloatEncoder), \
+         patch("av1_migrator.engine.validate_converted_file", return_value=(True, "OK", {})), \
+         patch("av1_migrator.engine.check_storage_safety", return_value=(True, "OK", StorageStats())):
+
+        engine = MigrationEngine(config=config, db=db, single_file=m2, no_ui=True)
+        res = engine.execute()
+
+        assert res["completed"] == 1
+        assert res["skipped"] == 0
+        final_out = m2.parent / f"{m2.stem} [AV1 1080p SDR CQ28].mkv"
+        assert final_out.exists()
+
+
 def test_engine_existing_bloated_output_removed_and_original_preserved(test_env):
     config = test_env["config"]
+    config.processing.av1_size_allowance = "0B"
     db = test_env["db"]
     m2 = test_env["m2"]
 

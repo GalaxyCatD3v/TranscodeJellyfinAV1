@@ -226,12 +226,21 @@ def run_pre_encode_sample_test(
         estimated_savings = media_file.size - estimated_total_bytes
         savings_pct = (estimated_savings / media_file.size) * 100.0 if media_file.size > 0 else 0.0
 
+        target_codec_str = getattr(media_file, "target_codec", "") or ""
+        is_av1 = (
+            "av1" in target_codec_str.lower()
+            or "av1" in getattr(config.output, "video_codec", "av1").lower()
+            or "av1" in getattr(config.output, "cpu_video_codec", "").lower()
+        )
+        av1_allowance = getattr(config.processing, "av1_size_allowance_bytes", 1024**3)
+        max_allowed_bytes = media_file.size + (av1_allowance if is_av1 else 0)
+
         min_savings_req = config.processing.min_savings_percent
 
-        if config.processing.keep_smaller and estimated_total_bytes >= media_file.size:
+        if config.processing.keep_smaller and estimated_total_bytes > max_allowed_bytes:
             reason = (
                 f"Sample test predicted bloat: estimated output ({format_bytes(estimated_total_bytes)}) "
-                f">= original ({format_bytes(media_file.size)}) [{savings_pct:+.1f}% space change]"
+                f"> maximum allowed limit ({format_bytes(max_allowed_bytes)}) [{savings_pct:+.1f}% space change]"
             )
             return OptimizationResult(
                 should_encode=False,
@@ -241,7 +250,7 @@ def run_pre_encode_sample_test(
                 reason=reason,
                 method="sample_test",
             )
-        elif savings_pct < min_savings_req:
+        elif min_savings_req > 0 and savings_pct < min_savings_req:
             reason = (
                 f"Sample test predicted insufficient savings: {savings_pct:.1f}% "
                 f"< required {min_savings_req:.1f}% ({format_bytes(estimated_total_bytes)} vs {format_bytes(media_file.size)})"
@@ -255,10 +264,17 @@ def run_pre_encode_sample_test(
                 method="sample_test",
             )
         else:
-            reason = (
-                f"Sample test predicts savings of {format_bytes(estimated_savings)} "
-                f"({savings_pct:.1f}% reduction, estimated size: {format_bytes(estimated_total_bytes)})"
-            )
+            if estimated_savings >= 0:
+                reason = (
+                    f"Sample test predicts savings of {format_bytes(estimated_savings)} "
+                    f"({savings_pct:.1f}% reduction, estimated size: {format_bytes(estimated_total_bytes)})"
+                )
+            else:
+                bloat_amount = abs(estimated_savings)
+                reason = (
+                    f"Sample test predicts output {format_bytes(bloat_amount)} larger ({savings_pct:+.1f}%), "
+                    f"within allowed AV1 preference threshold ({format_bytes(av1_allowance)} allowance, estimated size: {format_bytes(estimated_total_bytes)})"
+                )
             return OptimizationResult(
                 should_encode=True,
                 estimated_size_bytes=estimated_total_bytes,

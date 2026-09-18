@@ -131,6 +131,8 @@ class ProcessingConfig:
     delete_original: bool = True
     validate_output: bool = True
     keep_smaller: bool = True
+    stop_on_bloat: bool = True  # Stop transcode immediately during encoding if output exceeds max allowed size
+    av1_size_allowance: str = "1GB"  # Allow output to be up to 1GB larger than input for AV1 encodes
     pre_encode_check: bool = True  # Toggleable pre-encode space optimization & bloat prediction check
     sample_duration: float = 30.0  # Duration in seconds of sample clip for space optimization test
     min_savings_percent: float = 0.0  # Minimum % space savings required to proceed (0.0 = must not bloat)
@@ -146,6 +148,10 @@ class ProcessingConfig:
     network_retries: int = 3
     network_retry_delay: float = 30.0
     duration_tolerance: float = 2.0  # seconds
+
+    @property
+    def av1_size_allowance_bytes(self) -> int:
+        return parse_size_to_bytes(self.av1_size_allowance)
 
 
 @dataclass
@@ -296,6 +302,8 @@ def load_config(config_path: Optional[str | Path] = None) -> AppConfig:
                 delete_original=bool(pr_data.get("delete_original", config.processing.delete_original)),
                 validate_output=bool(pr_data.get("validate_output", config.processing.validate_output)),
                 keep_smaller=bool(pr_data.get("keep_smaller", config.processing.keep_smaller)),
+                stop_on_bloat=bool(pr_data.get("stop_on_bloat", config.processing.stop_on_bloat)),
+                av1_size_allowance=str(pr_data.get("av1_size_allowance", pr_data.get("av1_allowance", config.processing.av1_size_allowance))),
                 pre_encode_check=bool(pr_data.get("pre_encode_check", config.processing.pre_encode_check)),
                 sample_duration=float(pr_data.get("sample_duration", config.processing.sample_duration)),
                 min_savings_percent=float(pr_data.get("min_savings_percent", config.processing.min_savings_percent)),
@@ -303,7 +311,7 @@ def load_config(config_path: Optional[str | Path] = None) -> AppConfig:
                 enable_gpu1=bool(pr_data.get("enable_gpu1", config.processing.enable_gpu1)),
                 enable_gpu2=bool(pr_data.get("enable_gpu2", config.processing.enable_gpu2)),
                 gpu_workers=int(pr_data.get("gpu_workers", config.processing.gpu_workers)),
-                gpu_device_id=int(pr_data.get("gpu_device_id", config.processing.gpu_device_id)),
+                gpu_device_id=int(pr_data.get("gpu_device_id", pr_data.get("gpu_device", config.processing.gpu_device_id))),
                 enable_cpu_encoding=bool(pr_data.get("enable_cpu_encoding", config.processing.enable_cpu_encoding)),
                 cpu_max_file_size=pr_data.get("cpu_max_file_size", config.processing.cpu_max_file_size),
                 resume=bool(pr_data.get("resume", config.processing.resume)),

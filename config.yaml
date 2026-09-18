@@ -59,6 +59,8 @@ processing:
   delete_original: true
   validate_output: false
   keep_smaller: true
+  stop_on_bloat: true             # Stop transcode immediately during encoding if output exceeds max allowed size
+  av1_size_allowance: "1GB"       # Allow AV1 output to be up to 1GB larger than input due to AV1 preference
   pre_encode_check: true          # Pre-encode sample analysis to predict space savings & prevent wasted encoding
   sample_duration: 30.0           # Seconds of representative sample clip to test transcode
   min_savings_percent: 0.0        # Minimum % savings required to transcode (0.0 = must not bloat)

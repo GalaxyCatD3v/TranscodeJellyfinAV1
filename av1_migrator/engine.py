@@ -289,6 +289,7 @@ class MigrationEngine:
             validator_fn=validator_adapter,
             delete_original=self.config.processing.delete_original and not self.no_delete,
             keep_smaller=self.config.processing.keep_smaller,
+            av1_size_allowance_bytes=self.config.processing.av1_size_allowance_bytes,
         )
 
         if actions:
@@ -502,9 +503,18 @@ class MigrationEngine:
                     is_valid, v_msg, _ = validate_converted_file(mf.output_path, mf, self.config)
                     if is_valid:
                         out_sz = mf.output_path.stat().st_size
-                        if self.config.processing.keep_smaller and out_sz >= file_size:
+                        target_codec_str = getattr(mf, "target_codec", "") or ""
+                        is_av1 = (
+                            "av1" in target_codec_str.lower()
+                            or "av1" in getattr(self.config.output, "video_codec", "av1").lower()
+                            or "av1" in getattr(self.config.output, "cpu_video_codec", "").lower()
+                        )
+                        av1_allowance = getattr(self.config.processing, "av1_size_allowance_bytes", 1024**3)
+                        max_allowed_sz = file_size + (av1_allowance if is_av1 else 0)
+
+                        if self.config.processing.keep_smaller and out_sz > max_allowed_sz:
                             self.logger.warning(
-                                f"Existing output for {p.name} is larger ({format_bytes(out_sz)}) than or equal to original ({format_bytes(file_size)}). "
+                                f"Existing output for {p.name} is larger ({format_bytes(out_sz)}) than allowed limit ({format_bytes(max_allowed_sz)} = original {format_bytes(file_size)} + {format_bytes(av1_allowance)} allowance). "
                                 f"Prioritizing space: keeping smaller original and removing bloated output."
                             )
                             try:
@@ -847,6 +857,30 @@ class MigrationEngine:
             return
 
         if not encode_success:
+            is_bloat_stop = (
+                getattr(encoder, "is_bloat_abort", False)
+                or "exceeded maximum allowed" in str(encode_msg).lower()
+                or "bloat" in str(encode_msg).lower()
+            )
+            if is_bloat_stop:
+                self.logger.warning(f"Encoding stopped due to bloat for {media_file.source.name} ({worker_type}): {encode_msg}")
+                self._clean_staged(staged_source, staged_output)
+                with self.stats_lock:
+                    self.skipped_count += 1
+                self.db.update_status(
+                    media_file.source,
+                    status="skipped",
+                    output_path=media_file.output_path,
+                    skip_reason=f"Transcode aborted on bloat: {encode_msg}",
+                    source_bytes=media_file.size,
+                    output_bytes=media_file.size,
+                    worker=worker_type,
+                )
+                self._update_overall_pbar()
+                worker_pbar.set_description(f"{worker_type} [Idle]")
+                worker_pbar.set_postfix_str("Skipped bloated output")
+                return
+
             self.logger.error(f"Encoding failed for {media_file.source.name} ({worker_type}): {encode_msg}")
             self._clean_staged(staged_source, staged_output)
             with self.stats_lock:
@@ -887,10 +921,19 @@ class MigrationEngine:
 
         # 9. Space bloat rejection: discard bloated encode and keep smaller original
         out_sz = active_output.stat().st_size
-        if self.config.processing.keep_smaller and out_sz >= media_file.size:
+        target_codec_str = getattr(media_file, "target_codec", "") or ""
+        is_av1 = (
+            "av1" in target_codec_str.lower()
+            or "av1" in getattr(self.config.output, "video_codec", "av1").lower()
+            or "av1" in getattr(self.config.output, "cpu_video_codec", "").lower()
+        )
+        av1_allowance = getattr(self.config.processing, "av1_size_allowance_bytes", 1024**3)
+        max_allowed_sz = media_file.size + (av1_allowance if is_av1 else 0)
+
+        if self.config.processing.keep_smaller and out_sz > max_allowed_sz:
             self.logger.warning(
                 f"Encoding bloated for {media_file.source.name}: output ({format_bytes(out_sz)}) "
-                f"is larger than or equal to original ({format_bytes(media_file.size)}). Prioritizing space."
+                f"exceeds maximum allowed threshold ({format_bytes(max_allowed_sz)} = original {format_bytes(media_file.size)} + {format_bytes(av1_allowance)} allowance). Prioritizing space."
             )
             self._clean_staged(staged_source, active_output)
             with self.stats_lock:
@@ -900,8 +943,8 @@ class MigrationEngine:
                 status="skipped",
                 output_path=media_file.output_path,
                 skip_reason=(
-                    f"Encoding bloated: original is smaller "
-                    f"({format_bytes(media_file.size)} vs {format_bytes(out_sz)})"
+                    f"Encoding bloated: output ({format_bytes(out_sz)}) exceeds limit "
+                    f"({format_bytes(max_allowed_sz)})"
                 ),
                 source_bytes=media_file.size,
                 output_bytes=media_file.size,

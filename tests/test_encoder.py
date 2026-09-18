@@ -85,3 +85,63 @@ def test_encode_progress_eta_str():
 
     ep.eta_seconds = 3675.0
     assert ep.eta_str == "01:01:15"
+
+
+def test_encoder_stop_on_bloat_during_transcode(tmp_path):
+    from unittest.mock import MagicMock, patch
+    from av1_migrator.encoder import FFmpegEncoder
+
+    src = tmp_path / "video.mkv"
+    src.write_bytes(b"0" * 1000)
+    out = tmp_path / "video [AV1 1080p].mkv"
+    temp_out = tmp_path / "video [AV1 1080p].mkv.encoding.mkv"
+
+    config = AppConfig()
+    config.processing.keep_smaller = True
+    config.processing.stop_on_bloat = True
+    config.processing.av1_size_allowance = "500B"
+
+    mf = MediaFile(
+        source=src,
+        size=1000,
+        video_codec="hevc",
+        duration=100.0,
+        output_path=out,
+        temp_output_path=temp_out,
+    )
+
+    encoder = FFmpegEncoder(
+        media_file=mf,
+        config=config,
+        encoder_type="gpu",
+        input_path=src,
+        output_path=temp_out,
+    )
+
+    # Max allowed bytes is 1000 + 500 = 1500 bytes
+    assert encoder.max_allowed_bytes == 1500
+    assert encoder.stop_on_bloat is True
+
+    # Simulate FFmpeg process emitting stdout lines with total_size exceeding 1500 bytes
+    mock_stdout_lines = [
+        "frame=100\n",
+        "fps=60\n",
+        "total_size=800\n",
+        "progress=continue\n",
+        "frame=200\n",
+        "total_size=1800\n",  # Exceeds 1500 bytes threshold!
+        "progress=continue\n",
+    ]
+
+    mock_proc = MagicMock()
+    mock_proc.stdout = mock_stdout_lines
+    mock_proc.stderr = []
+    mock_proc.poll.return_value = None
+    mock_proc.returncode = 0
+
+    with patch("subprocess.Popen", return_value=mock_proc):
+        success, msg = encoder._execute_process(["ffmpeg"])
+        assert success is False
+        assert encoder.is_aborted is True
+        assert encoder.is_bloat_abort is True
+        assert "exceeded maximum allowed size" in msg.lower()

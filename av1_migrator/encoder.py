@@ -9,7 +9,7 @@ import subprocess
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
-from av1_migrator.config import AppConfig
+from av1_migrator.config import AppConfig, format_bytes, parse_size_to_bytes
 from av1_migrator.logger import get_logger
 from av1_migrator.models import EncodeProgress, MediaFile
 from av1_migrator.utils import find_binary_executable
@@ -287,9 +287,22 @@ class FFmpegEncoder:
         self.input_path = Path(input_path) if input_path else media_file.source
         self.output_path = Path(output_path) if output_path else media_file.temp_output_path
 
+        # Determine input size and max allowed size threshold
+        self.input_size = self.media_file.size or (self.input_path.stat().st_size if self.input_path and self.input_path.exists() else 0)
+        target_codec_str = getattr(self.media_file, "target_codec", "") or ""
+        self.is_av1 = (
+            "av1" in target_codec_str.lower()
+            or "av1" in getattr(self.config.output, "video_codec", "av1").lower()
+            or "av1" in getattr(self.config.output, "cpu_video_codec", "").lower()
+        )
+        self.av1_allowance = getattr(self.config.processing, "av1_size_allowance_bytes", 1024**3)
+        self.max_allowed_bytes = (self.input_size + (self.av1_allowance if self.is_av1 else 0)) if self.input_size > 0 else 0
+        self.stop_on_bloat = getattr(self.config.processing, "stop_on_bloat", True) and getattr(self.config.processing, "keep_smaller", True)
+
         self.process: Optional[subprocess.Popen] = None
         self.progress = EncodeProgress()
         self.is_aborted = False
+        self.is_bloat_abort = False
         self.abort_reason: Optional[str] = None
         self.return_code: Optional[int] = None
         self._lock = threading.Lock()
@@ -441,6 +454,13 @@ class FFmpegEncoder:
                         elif key == "total_size":
                             try:
                                 self.progress.total_size_bytes = int(val)
+                                if self.stop_on_bloat and self.max_allowed_bytes > 0 and self.progress.total_size_bytes > self.max_allowed_bytes:
+                                    self.is_bloat_abort = True
+                                    self.abort(
+                                        f"Output size ({format_bytes(self.progress.total_size_bytes)}) exceeded maximum allowed size "
+                                        f"({format_bytes(self.max_allowed_bytes)}) during transcoding"
+                                    )
+                                    break
                             except ValueError:
                                 pass
                         elif key == "out_time":
@@ -461,6 +481,21 @@ class FFmpegEncoder:
                                 except ValueError:
                                     pass
                         elif key == "progress":
+                            if self.stop_on_bloat and self.max_allowed_bytes > 0:
+                                cur_bytes = self.progress.total_size_bytes
+                                if self.output_path and self.output_path.exists():
+                                    try:
+                                        cur_bytes = max(cur_bytes, self.output_path.stat().st_size)
+                                    except Exception:
+                                        pass
+                                if cur_bytes > self.max_allowed_bytes:
+                                    self.is_bloat_abort = True
+                                    self.abort(
+                                        f"Output size ({format_bytes(cur_bytes)}) exceeded maximum allowed size "
+                                        f"({format_bytes(self.max_allowed_bytes)}) during transcoding"
+                                    )
+                                    break
+
                             if self.on_progress:
                                 try:
                                     self.on_progress(self.progress)

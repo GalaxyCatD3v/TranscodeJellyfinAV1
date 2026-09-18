@@ -105,6 +105,7 @@ def test_run_pre_encode_sample_test_predicted_bloat(sample_media_file):
     config = AppConfig()
     config.processing.sample_duration = 30.0
     config.processing.keep_smaller = True
+    config.processing.av1_size_allowance = "0MB"
 
     # 30s sample produces 6 MB -> 600s will be 120 MB (> original 100 MB)
     mock_stat = MagicMock()
@@ -120,6 +121,51 @@ def test_run_pre_encode_sample_test_predicted_bloat(sample_media_file):
         res = run_pre_encode_sample_test(sample_media_file, config)
         assert res.should_encode is False
         assert res.estimated_size_bytes == 120_000_000
+        assert "predicted bloat" in res.reason.lower()
+
+
+def test_run_pre_encode_sample_test_av1_preference_allowance(sample_media_file):
+    config = AppConfig()
+    config.processing.sample_duration = 30.0
+    config.processing.keep_smaller = True
+    config.processing.av1_size_allowance = "1GB"
+
+    # 30s sample produces 6 MB -> 600s will be 120 MB (20 MB larger than 100 MB, but within 1GB AV1 allowance)
+    mock_stat = MagicMock()
+    mock_stat.st_size = 6_000_000
+
+    with patch("subprocess.run") as mock_run, \
+         patch("pathlib.Path.is_file", return_value=True), \
+         patch("pathlib.Path.stat", return_value=mock_stat):
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_run.return_value = mock_proc
+
+        res = run_pre_encode_sample_test(sample_media_file, config)
+        assert res.should_encode is True
+        assert res.estimated_size_bytes == 120_000_000
+        assert "preference threshold" in res.reason.lower() or "within allowed" in res.reason.lower()
+
+
+def test_run_pre_encode_sample_test_predicted_bloat_exceeding_av1_allowance(sample_media_file):
+    config = AppConfig()
+    config.processing.sample_duration = 30.0
+    config.processing.keep_smaller = True
+    config.processing.av1_size_allowance = "1GB"
+
+    # 30s sample produces 60 MB -> 600s will be 1.2 GB (> original 100 MB + 1GB = 1.173 GB)
+    mock_stat = MagicMock()
+    mock_stat.st_size = 60_000_000
+
+    with patch("subprocess.run") as mock_run, \
+         patch("pathlib.Path.is_file", return_value=True), \
+         patch("pathlib.Path.stat", return_value=mock_stat):
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_run.return_value = mock_proc
+
+        res = run_pre_encode_sample_test(sample_media_file, config)
+        assert res.should_encode is False
         assert "predicted bloat" in res.reason.lower()
 
 

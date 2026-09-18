@@ -101,6 +101,7 @@ def test_db_cleanup_interrupted_tasks_bloated_output(tmp_path):
         validator_fn=mock_validator,
         delete_original=True,
         keep_smaller=True,
+        av1_size_allowance_bytes=0,
     )
 
     assert len(actions) == 1

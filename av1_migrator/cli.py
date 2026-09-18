@@ -236,6 +236,25 @@ def parse_args() -> argparse.Namespace:
         help="Maximum capacity limit for Z: drive manual staging (default: 700GB)",
     )
     parser.add_argument(
+        "--av1-size-allowance", "--av1-allowance",
+        type=str,
+        default=None,
+        help="Allowed size margin above input size for AV1 output (default: 1GB)",
+    )
+    parser.add_argument(
+        "--stop-on-bloat",
+        dest="stop_on_bloat",
+        action="store_true",
+        default=None,
+        help="Immediately abort transcode if output becomes larger than allowed limit (default: true)",
+    )
+    parser.add_argument(
+        "--no-stop-on-bloat",
+        dest="stop_on_bloat",
+        action="store_false",
+        help="Do not abort transcode mid-stream on bloat",
+    )
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Enable detailed debug logging to file and console",
@@ -318,6 +337,10 @@ def main() -> int:
         config.manual_staging.staging_dir = args.z_staging_dir
     if args.z_staging_max_size:
         config.manual_staging.max_size = args.z_staging_max_size
+    if args.av1_size_allowance:
+        config.processing.av1_size_allowance = args.av1_size_allowance
+    if args.stop_on_bloat is not None:
+        config.processing.stop_on_bloat = args.stop_on_bloat
 
     # Setup logger
     logger = setup_logger(

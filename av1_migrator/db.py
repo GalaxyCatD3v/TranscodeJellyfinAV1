@@ -365,12 +365,13 @@ class MigrationDB:
         validator_fn=None,
         delete_original: bool = False,
         keep_smaller: bool = True,
+        av1_size_allowance_bytes: int = 1024**3,
     ) -> List[Dict[str, Any]]:
         """
         Scans DB for interrupted tasks (status in 'encoding' or 'validating').
         - Removes stale temporary .encoding.mkv files.
         - If final output exists and passes validation:
-          - If keep_smaller is True and output is bloated (larger than or equal to source),
+          - If keep_smaller is True and output is bloated (larger than allowed limit),
             removes bloated output, keeps original source, and marks as skipped.
           - Otherwise marks as completed and safely deletes original if configured.
         - If original source exists, resets status to 'pending' so it can be cleanly retried.
@@ -413,7 +414,8 @@ class MigrationDB:
             if final_valid and out_path:
                 out_sz = out_path.stat().st_size
                 src_sz = row["source_size"]
-                if keep_smaller and out_sz >= src_sz and src_path.is_file():
+                max_allowed = src_sz + av1_size_allowance_bytes
+                if keep_smaller and out_sz > max_allowed and src_path.is_file():
                     # Bloated output: prioritize space by keeping smaller original
                     try:
                         out_path.unlink()
@@ -422,7 +424,7 @@ class MigrationDB:
                     self.update_status(
                         src_path,
                         status="skipped",
-                        skip_reason=f"Interrupted output was bloated ({src_sz} B source vs {out_sz} B output)",
+                        skip_reason=f"Interrupted output was bloated ({src_sz} B source vs {out_sz} B output, exceeds limit {max_allowed} B)",
                         source_bytes=src_sz,
                         output_bytes=src_sz,
                     )

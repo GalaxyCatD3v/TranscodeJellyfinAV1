@@ -94,3 +94,21 @@ def test_sshfs_and_manual_staging_config(tmp_path):
     assert config.manual_staging.staging_dir == "Z:\\JellyfinManualUpload"
     assert config.manual_staging.max_size_bytes == 700 * (1024**3)
     assert "manual_upload.db" in config.manual_staging.db_path
+
+
+def test_av1_size_allowance_and_bloat_stop_config(tmp_path):
+    config = load_config()
+    assert config.processing.stop_on_bloat is True
+    assert config.processing.av1_size_allowance == "1GB"
+    assert config.processing.av1_size_allowance_bytes == 1024**3
+
+    cfg_file = tmp_path / "custom_bloat.yaml"
+    cfg_file.write_text("""
+processing:
+  stop_on_bloat: false
+  av1_size_allowance: "500MB"
+""", encoding="utf-8")
+    custom_cfg = load_config(cfg_file)
+    assert custom_cfg.processing.stop_on_bloat is False
+    assert custom_cfg.processing.av1_size_allowance == "500MB"
+    assert custom_cfg.processing.av1_size_allowance_bytes == 500 * (1024**2)
