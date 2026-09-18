@@ -647,7 +647,8 @@ class MigrationEngine:
 
         # 2. Pre-encode optimization check: test sample to predict bloat
         if self.config.processing.pre_encode_check:
-            opt_res = evaluate_pre_encode_optimization(media_file, self.config)
+            with self.sshfs_stream_lock:
+                opt_res = evaluate_pre_encode_optimization(media_file, self.config)
             if not opt_res.should_encode:
                 self.logger.warning(f"Pre-encode check: Skipping {media_file.source.name}. {opt_res.reason}")
                 with self.stats_lock:
@@ -659,13 +660,14 @@ class MigrationEngine:
                     skip_reason=opt_res.reason,
                     source_bytes=media_file.size,
                     output_bytes=media_file.size,
+                    worker=worker_type,
                 )
                 self._update_overall_pbar()
                 worker_pbar.set_description(f"{worker_type} [Idle]")
                 worker_pbar.set_postfix_str(f"Skipped {media_file.source.name[:20]}")
                 return
 
-        # 3. Local Staging at Z:\JellyfinTranscode to eliminate remote SSHFS reading bottlenecks
+        # 3. Local Staging at F:\JellyfinTranscode to eliminate remote SSHFS reading bottlenecks
         staged_source: Optional[Path] = None
         staged_output: Optional[Path] = None
         active_input = media_file.source
@@ -686,10 +688,20 @@ class MigrationEngine:
                     hdr_tag = "HDR10" if media_file.hdr else "SDR"
                     staged_output = staging_dir / f"{worker_tag}_{stem_clean} [AV1 1080p {hdr_tag} CQ28].mkv.encoding.mkv"
 
-                    worker_pbar.set_description(f"{worker_type} [{media_file.source.name[:25]}]: Staging locally...")
-                    worker_pbar.set_postfix_str(f"Copying {format_bytes(media_file.size)} to {staging_dir.drive or staging_dir}...")
+                    worker_pbar.set_description(f"{worker_type} [{media_file.source.name[:25]}]: Waiting for SSHFS...")
+                    worker_pbar.set_postfix_str("Queued for network stream...")
 
-                    shutil.copy2(media_file.source, staged_source)
+                    with self.sshfs_stream_lock:
+                        self.db.update_status(
+                            media_file.source,
+                            status="staging",
+                            output_path=media_file.output_path,
+                            worker=worker_type,
+                        )
+                        worker_pbar.set_description(f"{worker_type} [{media_file.source.name[:25]}]: Staging locally...")
+                        worker_pbar.set_postfix_str(f"Copying {format_bytes(media_file.size)} to {staging_dir.drive or staging_dir}...")
+                        shutil.copy2(media_file.source, staged_source)
+
                     active_input = staged_source
                     active_output = staged_output
 
@@ -716,7 +728,10 @@ class MigrationEngine:
         # 5. Reset worker progress bar and configure progress handler
         worker_pbar.reset(total=100.0, desc=f"{worker_type} [{media_file.source.name[:25]}]")
 
+        last_db_progress_time = 0.0
+
         def on_progress(p: EncodeProgress):
+            nonlocal last_db_progress_time
             in_sz = format_bytes(media_file.size)
             out_sz = format_bytes(p.total_size_bytes)
             eta_val = getattr(p, "eta_str", "--:--:--")
@@ -735,6 +750,22 @@ class MigrationEngine:
                 worker_pbar.update(p.percent, postfix_str=" | ".join(parts))
             except Exception:
                 pass
+
+            now_ts = time.time()
+            if now_ts - last_db_progress_time >= 1.0 or p.percent >= 100.0:
+                last_db_progress_time = now_ts
+                try:
+                    self.db.update_progress(
+                        source_path=media_file.source,
+                        progress=p.percent,
+                        fps=p.fps,
+                        speed=p.speed,
+                        eta=eta_val,
+                        worker=worker_type,
+                        output_bytes=p.total_size_bytes,
+                    )
+                except Exception:
+                    pass
 
         # 6. Instantiate and run encoder (with graceful fallback for custom test mocks)
         enc_type = "cpu" if worker_type.startswith("CPU") else "gpu"
@@ -758,8 +789,14 @@ class MigrationEngine:
             self.active_encoders.append(encoder)
             self.active_encoder = encoder
 
-        self.db.update_status(media_file.source, status="encoding", output_path=media_file.output_path)
-        encode_success, encode_msg = encoder.run()
+        self.db.update_status(media_file.source, status="encoding", output_path=media_file.output_path, worker=worker_type)
+        if not staged_source:
+            # Direct remote streaming over SSHFS: lock to guarantee single stream
+            with self.sshfs_stream_lock:
+                encode_success, encode_msg = encoder.run()
+        else:
+            # Local NVMe encoding: zero network overhead
+            encode_success, encode_msg = encoder.run()
 
         with self.encoders_lock:
             if encoder in self.active_encoders:
@@ -794,6 +831,7 @@ class MigrationEngine:
                 status="failed",
                 output_path=media_file.output_path,
                 error=encode_msg,
+                worker=worker_type,
             )
             self._update_overall_pbar()
             worker_pbar.set_description(f"{worker_type} [Idle]")
@@ -802,7 +840,7 @@ class MigrationEngine:
 
         # 8. Output validation
         worker_pbar.set_description(f"{worker_type} [{media_file.source.name[:25]}]: Validating...")
-        self.db.update_status(media_file.source, status="validating", output_path=media_file.output_path)
+        self.db.update_status(media_file.source, status="validating", output_path=media_file.output_path, worker=worker_type)
 
         is_valid, val_msg, _ = validate_converted_file(active_output, media_file, self.config)
         if not is_valid:
@@ -815,6 +853,7 @@ class MigrationEngine:
                 status="failed",
                 output_path=media_file.output_path,
                 error=f"Validation failed: {val_msg}",
+                worker=worker_type,
             )
             self._update_overall_pbar()
             worker_pbar.set_description(f"{worker_type} [Idle]")
@@ -841,6 +880,7 @@ class MigrationEngine:
                 ),
                 source_bytes=media_file.size,
                 output_bytes=media_file.size,
+                worker=worker_type,
             )
             self._update_overall_pbar()
             worker_pbar.set_description(f"{worker_type} [Idle]")
@@ -850,33 +890,45 @@ class MigrationEngine:
         # 10. Atomic promotion to destination
         worker_pbar.set_description(f"{worker_type} [{media_file.source.name[:25]}]: Promoting...")
         final_path = media_file.output_path
+        is_final_valid = True
+        fval_msg = ""
 
         if active_output != final_path:
             # Staged locally: copy to remote staging temp then atomic rename
             remote_temp = media_file.temp_output_path or (media_file.source.parent / f"{media_file.source.stem}.encoding.mkv")
             try:
                 if active_output != remote_temp:
-                    shutil.copy2(active_output, remote_temp)
-                    os.replace(str(remote_temp), str(final_path))
+                    worker_pbar.set_description(f"{worker_type} [{media_file.source.name[:25]}]: Waiting for SSHFS...")
+                    worker_pbar.set_postfix_str("Queued for upload...")
+                    with self.sshfs_stream_lock:
+                        worker_pbar.set_description(f"{worker_type} [{media_file.source.name[:25]}]: Promoting to SSHFS...")
+                        worker_pbar.set_postfix_str(f"Uploading {format_bytes(out_sz)}...")
+                        shutil.copy2(active_output, remote_temp)
+                        os.replace(str(remote_temp), str(final_path))
+                        is_final_valid, fval_msg, _ = validate_converted_file(final_path, media_file, self.config)
                     active_output.unlink(missing_ok=True)
                 else:
-                    os.replace(str(active_output), str(final_path))
+                    with self.sshfs_stream_lock:
+                        os.replace(str(active_output), str(final_path))
+                        is_final_valid, fval_msg, _ = validate_converted_file(final_path, media_file, self.config)
             except Exception as e:
                 self.logger.error(f"Failed promoting from local staging to {final_path}: {e}")
                 self._clean_staged(staged_source, active_output)
                 with self.stats_lock:
                     self.failed_count += 1
-                self.db.update_status(media_file.source, status="failed", error=f"Promotion failed: {e}")
+                self.db.update_status(media_file.source, status="failed", error=f"Promotion failed: {e}", worker=worker_type)
                 self._update_overall_pbar()
                 return
         else:
             try:
-                os.replace(str(active_output), str(final_path))
+                with self.sshfs_stream_lock:
+                    os.replace(str(active_output), str(final_path))
+                    is_final_valid, fval_msg, _ = validate_converted_file(final_path, media_file, self.config)
             except Exception as e:
                 self.logger.error(f"Failed to replace {active_output} -> {final_path}: {e}")
                 with self.stats_lock:
                     self.failed_count += 1
-                self.db.update_status(media_file.source, status="failed", error=f"Promotion failed: {e}")
+                self.db.update_status(media_file.source, status="failed", error=f"Promotion failed: {e}", worker=worker_type)
                 self._update_overall_pbar()
                 return
 
@@ -888,7 +940,6 @@ class MigrationEngine:
                     self.staged_files.remove(staged_source)
 
         # 11. Final validation on remote promoted file
-        is_final_valid, fval_msg, _ = validate_converted_file(final_path, media_file, self.config)
         if not is_final_valid:
             self.logger.critical(f"Final validation failed on promoted file {final_path}: {fval_msg}")
             with self.stats_lock:
@@ -898,6 +949,7 @@ class MigrationEngine:
                 status="failed",
                 output_path=final_path,
                 error=f"Post-promotion validation failed: {fval_msg}",
+                worker=worker_type,
             )
             self._update_overall_pbar()
             return
@@ -924,6 +976,7 @@ class MigrationEngine:
             output_path=final_path,
             source_bytes=media_file.size,
             output_bytes=final_size,
+            worker=worker_type,
         )
 
         self.logger.info(

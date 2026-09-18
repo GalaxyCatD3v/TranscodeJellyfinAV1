@@ -187,3 +187,84 @@ def test_multi_gpu_worker_execution(tmp_path):
         assert res["failed"] == 0
         assert all(w == "gpu" for w in workers_invoked)
         assert len(workers_invoked) == 3
+
+
+def test_single_gpu_worker_execution(tmp_path):
+    media_dir = tmp_path / "Media"
+    media_dir.mkdir()
+    staging_dir = tmp_path / "Staging"
+    staging_dir.mkdir()
+
+    f1 = media_dir / "Movie1.mkv"
+    f1.write_bytes(b"1" * 15000)
+
+    db_path = tmp_path / "test_single_gpu.db"
+    db = MigrationDB(db_path)
+
+    config = AppConfig()
+    config.media_roots = [str(media_dir)]
+    config.storage.minimum_free_space = "1KB"
+    config.storage.safety_margin = "100B"
+    config.storage.local_staging_dir = str(staging_dir)
+    config.storage.enable_local_staging = True
+    config.storage.local_min_free_space = "1KB"
+    config.processing.enable_gpu_encoding = True
+    config.processing.enable_gpu1 = True
+    config.processing.enable_gpu2 = False
+    config.processing.gpu_workers = 1
+    config.processing.enable_cpu_encoding = False
+    config.processing.pre_encode_check = False
+    config.processing.delete_original = True
+
+    workers_invoked = []
+
+    class MockWorkerEncoder:
+        def __init__(self, media_file, config, on_progress=None, encoder_type="gpu", input_path=None, output_path=None, **kwargs):
+            self.media_file = media_file
+            self.encoder_type = encoder_type
+            self.output_path = output_path or media_file.temp_output_path
+
+        def run(self):
+            workers_invoked.append(self.encoder_type)
+            self.output_path.write_bytes(b"av1 data" * 10)
+            return True, "Success"
+
+        def abort(self, reason=""):
+            pass
+
+    def mock_probe(p, cfg):
+        sz = p.stat().st_size
+        return MediaFile(
+            source=p,
+            size=sz,
+            video_codec="hevc",
+            duration=60.0,
+            hdr=False,
+            output_path=p.parent / f"{p.stem} [AV1 1080p SDR CQ28].mkv",
+            temp_output_path=p.parent / f"{p.stem} [AV1 1080p SDR CQ28].mkv.encoding.mkv",
+            selected_video=VideoStream(index=0, codec_name="hevc", width=1920, height=1080),
+            selected_audio=[AudioStream(index=1, codec_name="aac", language="eng")],
+            status="pending",
+        )
+
+    with patch("av1_migrator.engine.probe_and_populate_media_file", side_effect=mock_probe), \
+         patch("av1_migrator.engine.FFmpegEncoder", MockWorkerEncoder), \
+         patch("av1_migrator.engine.validate_converted_file", return_value=(True, "OK", {})), \
+         patch("av1_migrator.engine.is_av1_nvenc_available", return_value=True), \
+         patch("av1_migrator.engine.check_storage_safety", return_value=(True, "OK", MagicMock(free_bytes=10**12, minimum_free_bytes=10**9))):
+
+        engine = MigrationEngine(config=config, db=db, no_ui=True)
+        res = engine.execute()
+
+        assert res["completed"] == 1
+        assert res["failed"] == 0
+        assert workers_invoked == ["gpu"]
+
+        # Check that DB recorded worker, progress, and destination
+        rec = db.get_file(f1)
+        assert rec["status"] == "completed"
+        assert rec["progress"] == 100.0
+        assert rec["worker"] == "GPU"
+        assert rec["target_codec"] == "av1"
+        assert rec["resolution"] == "1920x1080"
+        assert rec["output_path"] is not None

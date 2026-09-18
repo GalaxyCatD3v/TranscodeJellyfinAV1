@@ -70,3 +70,13 @@ processing:
 """, encoding="utf-8")
     config = load_config(cfg_file)
     assert config.processing.scan_cache_hours == 12.0
+
+
+def test_single_gpu_config_defaults_and_db_path(tmp_path):
+    config = load_config()
+    assert config.processing.enable_gpu_encoding is True
+    assert config.processing.enable_gpu1 is True
+    assert config.processing.enable_gpu2 is False
+    assert config.processing.gpu_workers == 1
+    assert config.processing.enable_cpu_encoding is False
+    assert "F:" in config.database.path or "migration.db" in config.database.path

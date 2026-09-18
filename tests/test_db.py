@@ -148,3 +148,66 @@ def test_db_path_normalization_and_output_path_saving(tmp_path):
     assert row["status"] == "completed"
     assert row["output_path"] is not None
     assert row["output_bytes"] == 50000
+
+
+def test_db_progress_and_rich_metrics(tmp_path):
+    db_file = tmp_path / "test_rich_metrics.db"
+    db = MigrationDB(db_file)
+
+    source = tmp_path / "4k_movie.mkv"
+    dest = tmp_path / "4k_movie [AV1 1080p SDR CQ28].mkv"
+
+    db.upsert_file(
+        source_path=source,
+        source_size=10000000,
+        source_mtime=1234.0,
+        output_path=dest,
+        status="pending",
+        source_codec="hevc",
+        target_codec="av1",
+        resolution="3840x2160",
+        duration=7200.0,
+        hdr=True,
+    )
+
+    row = db.get_file(source)
+    assert row["source_codec"] == "hevc"
+    assert row["target_codec"] == "av1"
+    assert row["resolution"] == "3840x2160"
+    assert row["progress"] == 0.0
+
+    # Live progress updates
+    db.update_progress(
+        source_path=source,
+        progress=45.5,
+        fps=120.0,
+        speed=2.5,
+        eta="00:15:30",
+        worker="GPU",
+        output_bytes=2000000,
+    )
+
+    row = db.get_file(source)
+    assert row["progress"] == 45.5
+    assert row["fps"] == 120.0
+    assert row["speed"] == 2.5
+    assert row["eta"] == "00:15:30"
+    assert row["worker"] == "GPU"
+    assert row["last_updated"] is not None
+
+    # Complete migration
+    db.update_status(
+        source_path=source,
+        status="completed",
+        output_path=dest,
+        source_bytes=10000000,
+        output_bytes=4000000,
+        worker="GPU",
+    )
+
+    row = db.get_file(source)
+    assert row["status"] == "completed"
+    assert row["progress"] == 100.0
+    assert row["saved_bytes"] == 6000000
+    assert row["savings_percent"] == 60.0
+    assert row["completed_at"] is not None
