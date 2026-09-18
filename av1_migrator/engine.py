@@ -5,6 +5,7 @@ Enforces strict safety priorities, SQLite state persistence, multi-worker concur
 """
 
 from datetime import datetime
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -684,12 +685,13 @@ class MigrationEngine:
                 required_local = media_file.size * 2 + self.config.storage.local_min_free_space_bytes
 
                 if local_free >= required_local:
+                    src_hash = hashlib.sha256(str(media_file.source).encode("utf-8")).hexdigest()[:8]
                     stem_clean = sanitize_filename(media_file.source.stem)
                     ext_clean = media_file.source.suffix
                     worker_tag = sanitize_filename(worker_type.lower().replace(" ", "_"))
-                    staged_source = staging_dir / f"{worker_tag}_{stem_clean}{ext_clean}"
+                    staged_source = staging_dir / f"{worker_tag}_{stem_clean}_{src_hash}{ext_clean}"
                     hdr_tag = "HDR10" if media_file.hdr else "SDR"
-                    staged_output = staging_dir / f"{worker_tag}_{stem_clean} [AV1 1080p {hdr_tag} CQ28].mkv.encoding.mkv"
+                    staged_output = staging_dir / f"{worker_tag}_{stem_clean}_{src_hash} [AV1 1080p {hdr_tag} CQ28].mkv.encoding.mkv"
 
                     worker_pbar.set_description(f"{worker_type} [{media_file.source.name[:25]}]: Waiting for SSHFS...")
                     worker_pbar.set_postfix_str("Queued for network stream...")
@@ -904,6 +906,12 @@ class MigrationEngine:
                     worker_pbar.set_description(f"{worker_type} [{media_file.source.name[:25]}]: Waiting for SSHFS...")
                     worker_pbar.set_postfix_str("Queued for upload...")
                     with self.sshfs_stream_lock:
+                        self.db.update_status(
+                            media_file.source,
+                            status="uploading",
+                            output_path=media_file.output_path,
+                            worker=worker_type,
+                        )
                         worker_pbar.set_description(f"{worker_type} [{media_file.source.name[:25]}]: Promoting to SSHFS...")
                         worker_pbar.set_postfix_str(f"Uploading {format_bytes(out_sz)}...")
                         shutil.copy2(active_output, remote_temp)
@@ -912,6 +920,12 @@ class MigrationEngine:
                     active_output.unlink(missing_ok=True)
                 else:
                     with self.sshfs_stream_lock:
+                        self.db.update_status(
+                            media_file.source,
+                            status="uploading",
+                            output_path=media_file.output_path,
+                            worker=worker_type,
+                        )
                         os.replace(str(active_output), str(final_path))
                         is_final_valid, fval_msg, _ = validate_converted_file(final_path, media_file, self.config)
             except Exception as e:
@@ -925,6 +939,12 @@ class MigrationEngine:
         else:
             try:
                 with self.sshfs_stream_lock:
+                    self.db.update_status(
+                        media_file.source,
+                        status="uploading",
+                        output_path=media_file.output_path,
+                        worker=worker_type,
+                    )
                     os.replace(str(active_output), str(final_path))
                     is_final_valid, fval_msg, _ = validate_converted_file(final_path, media_file, self.config)
             except Exception as e:
@@ -962,7 +982,8 @@ class MigrationEngine:
         if self.config.processing.delete_original and not self.no_delete:
             if media_file.source.exists() and media_file.source != final_path:
                 try:
-                    media_file.source.unlink()
+                    with self.sshfs_stream_lock:
+                        media_file.source.unlink()
                     self.logger.info(f"Safely deleted original file: {media_file.source}")
                 except Exception as e:
                     self.logger.error(f"Failed to delete original file {media_file.source}: {e}")

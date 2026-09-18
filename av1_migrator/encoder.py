@@ -191,7 +191,8 @@ def build_ffmpeg_command(
                 "-pix_fmt", "yuv420p10le",
             ])
     else:
-        # GPU Encoding (av1_nvenc)
+        # GPU Encoding (av1_nvenc on dedicated GPU card)
+        gpu_id = getattr(config.output, "gpu_device", getattr(config.processing, "gpu_device_id", 0))
         if use_cuda_scale:
             vf_filter = f"hwupload_cuda,scale_cuda={target_w}:{target_h}:interp_algo={interp}"
         else:
@@ -200,6 +201,10 @@ def build_ffmpeg_command(
 
         cmd.extend([
             "-c:v", config.output.video_codec,
+        ])
+        if "nvenc" in config.output.video_codec.lower():
+            cmd.extend(["-gpu", str(gpu_id)])
+        cmd.extend([
             "-preset", config.output.preset,
             "-cq", str(config.output.cq),
             "-pix_fmt", config.output.pixel_format,

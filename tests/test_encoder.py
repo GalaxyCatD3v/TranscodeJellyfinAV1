@@ -46,6 +46,8 @@ def test_encoder_build_command():
     cmd = build_ffmpeg_command(mf, config, use_cuda_scale=True)
     assert "-c:v" in cmd
     assert "av1_nvenc" in cmd
+    assert "-gpu" in cmd
+    assert "0" in cmd
     assert "-preset" in cmd
     assert "p5" in cmd
     assert "-cq" in cmd

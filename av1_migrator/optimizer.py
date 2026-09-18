@@ -81,9 +81,14 @@ def build_sample_ffmpeg_command(
 
     cmd.extend(["-vf", vf_filter])
 
-    # Video Codec settings
+    # Video Codec settings (dedicated GPU card)
+    gpu_id = getattr(config.output, "gpu_device", getattr(config.processing, "gpu_device_id", 0))
     cmd.extend([
         "-c:v", config.output.video_codec,
+    ])
+    if "nvenc" in config.output.video_codec.lower():
+        cmd.extend(["-gpu", str(gpu_id)])
+    cmd.extend([
         "-preset", config.output.preset,
         "-cq", str(config.output.cq),
         "-pix_fmt", config.output.pixel_format,
