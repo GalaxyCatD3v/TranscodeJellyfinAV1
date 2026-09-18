@@ -2,8 +2,8 @@
 # Safely converts Jellyfin media library over SSHFS to AV1 1080p using NVIDIA NVENC.
 
 media_roots:
-  - "V:\\srv\\storage\\Movies"
-  - "V:\\media\\TVShows"
+  - "U:\\srv\\storage\\Movies"
+  - "U:\\media\\TVShows"
 
 extensions:
   - ".mkv"
@@ -86,6 +86,24 @@ ui:
 
 database:
   path: "F:\\JellyfinTranscode\\migration.db"
+
+sshfs:
+  enabled: true
+  mount_drive: "U:"
+  host: "192.168.1.180"
+  user: "root"
+  password: "Trent101$$"
+  remote_path: "/"
+  max_retries: 5
+  reconnect_delay: 5.0
+  timeout_seconds: 300.0
+  manage_connection: true
+
+manual_staging:
+  enabled: true
+  staging_dir: "Z:\\JellyfinManualUpload"
+  max_size: "700GB"
+  db_path: "Z:\\JellyfinManualUpload\\manual_upload.db"
 
 logging:
   directory: "logs"

@@ -170,6 +170,32 @@ class DatabaseConfig:
 
 
 @dataclass
+class SSHFSConfig:
+    enabled: bool = True
+    mount_drive: str = "U:"
+    host: str = "192.168.1.180"
+    user: str = "root"
+    password: str = "Trent101$$"
+    remote_path: str = "/"
+    max_retries: int = 5
+    reconnect_delay: float = 5.0
+    timeout_seconds: float = 300.0
+    manage_connection: bool = True
+
+
+@dataclass
+class ManualStagingConfig:
+    enabled: bool = True
+    staging_dir: str = "Z:\\JellyfinManualUpload"
+    max_size: str = "700GB"
+    db_path: str = "Z:\\JellyfinManualUpload\\manual_upload.db"
+
+    @property
+    def max_size_bytes(self) -> int:
+        return parse_size_to_bytes(self.max_size)
+
+
+@dataclass
 class LoggingConfig:
     directory: str = "logs"
     filename: str = "av1-migrator.log"
@@ -179,7 +205,7 @@ class LoggingConfig:
 
 @dataclass
 class AppConfig:
-    media_roots: List[str] = field(default_factory=lambda: ["Y:\\srv\\storage\\Movies", "Y:\\media\\TVShows"])
+    media_roots: List[str] = field(default_factory=lambda: ["U:\\srv\\storage\\Movies", "U:\\media\\TVShows"])
     extensions: List[str] = field(default_factory=lambda: [".mkv", ".mp4", ".m4v", ".m2ts", ".ts", ".avi", ".mov"])
     output: OutputConfig = field(default_factory=OutputConfig)
     audio: AudioConfig = field(default_factory=AudioConfig)
@@ -190,6 +216,8 @@ class AppConfig:
     ffmpeg: FFmpegConfig = field(default_factory=FFmpegConfig)
     ui: UIConfig = field(default_factory=UIConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
+    sshfs: SSHFSConfig = field(default_factory=SSHFSConfig)
+    manual_staging: ManualStagingConfig = field(default_factory=ManualStagingConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
 
@@ -308,6 +336,30 @@ def load_config(config_path: Optional[str | Path] = None) -> AppConfig:
             db_data = raw_data["database"]
             config.database = DatabaseConfig(
                 path=db_data.get("path", config.database.path)
+            )
+
+        if "sshfs" in raw_data and isinstance(raw_data["sshfs"], dict):
+            sf_data = raw_data["sshfs"]
+            config.sshfs = SSHFSConfig(
+                enabled=bool(sf_data.get("enabled", config.sshfs.enabled)),
+                mount_drive=str(sf_data.get("mount_drive", config.sshfs.mount_drive)),
+                host=str(sf_data.get("host", config.sshfs.host)),
+                user=str(sf_data.get("user", config.sshfs.user)),
+                password=str(sf_data.get("password", config.sshfs.password)),
+                remote_path=str(sf_data.get("remote_path", config.sshfs.remote_path)),
+                max_retries=int(sf_data.get("max_retries", config.sshfs.max_retries)),
+                reconnect_delay=float(sf_data.get("reconnect_delay", config.sshfs.reconnect_delay)),
+                timeout_seconds=float(sf_data.get("timeout_seconds", config.sshfs.timeout_seconds)),
+                manage_connection=bool(sf_data.get("manage_connection", config.sshfs.manage_connection)),
+            )
+
+        if "manual_staging" in raw_data and isinstance(raw_data["manual_staging"], dict):
+            ms_data = raw_data["manual_staging"]
+            config.manual_staging = ManualStagingConfig(
+                enabled=bool(ms_data.get("enabled", config.manual_staging.enabled)),
+                staging_dir=str(ms_data.get("staging_dir", config.manual_staging.staging_dir)),
+                max_size=str(ms_data.get("max_size", config.manual_staging.max_size)),
+                db_path=str(ms_data.get("db_path", config.manual_staging.db_path)),
             )
             
         if "logging" in raw_data and isinstance(raw_data["logging"], dict):

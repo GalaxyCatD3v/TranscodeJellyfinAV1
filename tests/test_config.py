@@ -82,3 +82,15 @@ def test_single_gpu_config_defaults_and_db_path(tmp_path):
     assert config.output.gpu_device == 0
     assert config.processing.enable_cpu_encoding is False
     assert "F:" in config.database.path or "migration.db" in config.database.path
+
+
+def test_sshfs_and_manual_staging_config(tmp_path):
+    config = load_config()
+    assert config.sshfs.mount_drive == "U:"
+    assert config.sshfs.host == "192.168.1.180"
+    assert config.sshfs.user == "root"
+    assert config.sshfs.password == "Trent101$$"
+    assert config.sshfs.max_retries == 5
+    assert config.manual_staging.staging_dir == "Z:\\JellyfinManualUpload"
+    assert config.manual_staging.max_size_bytes == 700 * (1024**3)
+    assert "manual_upload.db" in config.manual_staging.db_path

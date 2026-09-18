@@ -308,7 +308,7 @@ class MigrationDB:
                 if completed_at is not None:
                     updates.append("completed_at = ?")
                     params.append(completed_at)
-                elif status in ("completed", "failed", "skipped", "aborted"):
+                elif status in ("completed", "failed", "skipped", "aborted", "ready_for_manual_transfer"):
                     updates.append("completed_at = ?")
                     params.append(now_str)
                 
@@ -328,6 +328,7 @@ class MigrationDB:
                 SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) as skipped_count,
                 SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed_count,
                 SUM(CASE WHEN status = 'aborted' THEN 1 ELSE 0 END) as aborted_count,
+                SUM(CASE WHEN status = 'ready_for_manual_transfer' THEN 1 ELSE 0 END) as manual_transfer_count,
                 SUM(CASE WHEN status = 'completed' THEN COALESCE(source_bytes, source_size) ELSE 0 END) as completed_source_bytes,
                 SUM(CASE WHEN status = 'completed' THEN COALESCE(output_bytes, 0) ELSE 0 END) as completed_output_bytes,
                 SUM(CASE WHEN status IN ('pending', 'encoding', 'aborted') THEN source_size ELSE 0 END) as remaining_bytes,

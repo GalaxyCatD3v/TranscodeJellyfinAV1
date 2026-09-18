@@ -200,6 +200,42 @@ def parse_args() -> argparse.Namespace:
         help="Disable local staging (encode directly over remote storage)",
     )
     parser.add_argument(
+        "--sshfs-mount",
+        type=str,
+        default=None,
+        help="SSHFS mount drive letter (default: U:)",
+    )
+    parser.add_argument(
+        "--sshfs-host",
+        type=str,
+        default=None,
+        help="SSHFS remote host (default: 192.168.1.180)",
+    )
+    parser.add_argument(
+        "--sshfs-user",
+        type=str,
+        default=None,
+        help="SSHFS remote user (default: root)",
+    )
+    parser.add_argument(
+        "--sshfs-retries",
+        type=int,
+        default=None,
+        help="Max upload retries before staging to Z: drive (default: 5)",
+    )
+    parser.add_argument(
+        "--z-staging-dir",
+        type=str,
+        default=None,
+        help="Directory on Z: drive for failed upload manual staging (default: Z:\\JellyfinManualUpload)",
+    )
+    parser.add_argument(
+        "--z-staging-max-size",
+        type=str,
+        default=None,
+        help="Maximum capacity limit for Z: drive manual staging (default: 700GB)",
+    )
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Enable detailed debug logging to file and console",
@@ -270,6 +306,18 @@ def main() -> int:
         config.storage.local_staging_dir = args.staging_dir
     if args.no_staging:
         config.storage.enable_local_staging = False
+    if args.sshfs_mount:
+        config.sshfs.mount_drive = args.sshfs_mount
+    if args.sshfs_host:
+        config.sshfs.host = args.sshfs_host
+    if args.sshfs_user:
+        config.sshfs.user = args.sshfs_user
+    if args.sshfs_retries is not None:
+        config.sshfs.max_retries = max(1, args.sshfs_retries)
+    if args.z_staging_dir:
+        config.manual_staging.staging_dir = args.z_staging_dir
+    if args.z_staging_max_size:
+        config.manual_staging.max_size = args.z_staging_max_size
 
     # Setup logger
     logger = setup_logger(

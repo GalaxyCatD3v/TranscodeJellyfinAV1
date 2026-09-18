@@ -39,6 +39,7 @@ from av1_migrator.progress import (
     MigrationProgressBar,
 )
 from av1_migrator.scanner import is_encoding_temp_file, scan_all_roots
+from av1_migrator.sshfs import SSHFSManager, ManualStagingManager
 from av1_migrator.storage import check_storage_safety, get_path_disk_usage, StorageMonitorThread
 from av1_migrator.utils import find_binary_executable, normalize_filepath, sanitize_filename
 from av1_migrator.validator import validate_converted_file
@@ -71,6 +72,8 @@ class MigrationEngine:
 
         self.logger = get_logger()
         self.gpu_monitor = GPUMonitorThread(poll_interval=1.0)
+        self.sshfs_manager = SSHFSManager(getattr(config, "sshfs", None))
+        self.manual_staging_mgr = ManualStagingManager(getattr(config, "manual_staging", None))
 
         self.is_running = False
         self.is_paused = False
@@ -180,6 +183,23 @@ class MigrationEngine:
                 checks.append(f"✓ Media root: {r}")
             else:
                 checks.append(f"⚠ Media root currently inaccessible: {r}")
+
+        # SSHFS Connection Check & Management
+        if getattr(self.config, "sshfs", None) and self.config.sshfs.enabled:
+            if self.config.sshfs.manage_connection and not self.sshfs_manager.is_mounted():
+                self.sshfs_manager.mount()
+            if self.sshfs_manager.is_mounted():
+                checks.append(f"✓ SSHFS Mount: {self.config.sshfs.mount_drive} ({self.config.sshfs.user}@{self.config.sshfs.host})")
+            else:
+                checks.append(f"⚠ SSHFS Mount: {self.config.sshfs.mount_drive} not currently connected")
+
+        # Z: Drive Manual Staging Check
+        if getattr(self.config, "manual_staging", None) and self.config.manual_staging.enabled:
+            try:
+                self.manual_staging_mgr.ensure_staging_dir()
+                checks.append(f"✓ Z: Drive Manual Staging: {self.config.manual_staging.staging_dir} (Limit: {self.config.manual_staging.max_size})")
+            except Exception as e:
+                checks.append(f"⚠ Z: Drive Manual Staging notice: {e}")
 
         # Storage safety check
         for r in self.config.media_roots:
@@ -892,51 +912,18 @@ class MigrationEngine:
             worker_pbar.set_postfix_str("Skipped bloated output")
             return
 
-        # 10. Atomic promotion to destination
+        # 10. Atomic promotion to destination with retry and Z: drive manual staging fallback
         worker_pbar.set_description(f"{worker_type} [{media_file.source.name[:25]}]: Promoting...")
         final_path = media_file.output_path
+        max_upload_retries = getattr(self.config.sshfs, "max_retries", 5) if getattr(self.config, "sshfs", None) else 5
+        upload_success = False
+        last_error = ""
         is_final_valid = True
         fval_msg = ""
 
-        if active_output != final_path:
-            # Staged locally: copy to remote staging temp then atomic rename
-            remote_temp = media_file.temp_output_path or (media_file.source.parent / f"{media_file.source.stem}.encoding.mkv")
-            try:
-                if active_output != remote_temp:
-                    worker_pbar.set_description(f"{worker_type} [{media_file.source.name[:25]}]: Waiting for SSHFS...")
-                    worker_pbar.set_postfix_str("Queued for upload...")
-                    with self.sshfs_stream_lock:
-                        self.db.update_status(
-                            media_file.source,
-                            status="uploading",
-                            output_path=media_file.output_path,
-                            worker=worker_type,
-                        )
-                        worker_pbar.set_description(f"{worker_type} [{media_file.source.name[:25]}]: Promoting to SSHFS...")
-                        worker_pbar.set_postfix_str(f"Uploading {format_bytes(out_sz)}...")
-                        shutil.copy2(active_output, remote_temp)
-                        os.replace(str(remote_temp), str(final_path))
-                        is_final_valid, fval_msg, _ = validate_converted_file(final_path, media_file, self.config)
-                    active_output.unlink(missing_ok=True)
-                else:
-                    with self.sshfs_stream_lock:
-                        self.db.update_status(
-                            media_file.source,
-                            status="uploading",
-                            output_path=media_file.output_path,
-                            worker=worker_type,
-                        )
-                        os.replace(str(active_output), str(final_path))
-                        is_final_valid, fval_msg, _ = validate_converted_file(final_path, media_file, self.config)
-            except Exception as e:
-                self.logger.error(f"Failed promoting from local staging to {final_path}: {e}")
-                self._clean_staged(staged_source, active_output)
-                with self.stats_lock:
-                    self.failed_count += 1
-                self.db.update_status(media_file.source, status="failed", error=f"Promotion failed: {e}", worker=worker_type)
-                self._update_overall_pbar()
-                return
-        else:
+        for attempt in range(1, max_upload_retries + 1):
+            worker_pbar.set_description(f"{worker_type} [{media_file.source.name[:25]}]: Upload attempt {attempt}/{max_upload_retries}...")
+            worker_pbar.set_postfix_str("Queued for network stream...")
             try:
                 with self.sshfs_stream_lock:
                     self.db.update_status(
@@ -945,40 +932,95 @@ class MigrationEngine:
                         output_path=media_file.output_path,
                         worker=worker_type,
                     )
-                    os.replace(str(active_output), str(final_path))
-                    is_final_valid, fval_msg, _ = validate_converted_file(final_path, media_file, self.config)
-            except Exception as e:
-                self.logger.error(f"Failed to replace {active_output} -> {final_path}: {e}")
-                with self.stats_lock:
-                    self.failed_count += 1
-                self.db.update_status(media_file.source, status="failed", error=f"Promotion failed: {e}", worker=worker_type)
-                self._update_overall_pbar()
-                return
+                    worker_pbar.set_description(f"{worker_type} [{media_file.source.name[:25]}]: Promoting to SSHFS...")
+                    worker_pbar.set_postfix_str(f"Uploading {format_bytes(out_sz)} (attempt {attempt})...")
+                    if final_path.parent:
+                        final_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Clean staged source
+                    if active_output != final_path:
+                        remote_temp = media_file.temp_output_path or (final_path.parent / f"{final_path.stem}.encoding.mkv")
+                        if active_output != remote_temp:
+                            shutil.copy2(active_output, remote_temp)
+                            os.replace(str(remote_temp), str(final_path))
+                        else:
+                            os.replace(str(active_output), str(final_path))
+                    else:
+                        temp_dest = final_path.parent / f"{final_path.stem}.encoding.mkv"
+                        if active_output != temp_dest and active_output.exists():
+                            os.replace(str(active_output), str(final_path))
+
+                    is_final_valid, fval_msg, _ = validate_converted_file(final_path, media_file, self.config)
+                    if not is_final_valid:
+                        raise RuntimeError(f"Post-upload validation failed: {fval_msg}")
+
+                    upload_success = True
+                    break
+            except Exception as e:
+                last_error = str(e)
+                self.logger.warning(
+                    f"Upload attempt {attempt}/{max_upload_retries} failed for {media_file.source.name}: {e}. "
+                    f"Restarting SSHFS connection..."
+                )
+                if attempt < max_upload_retries:
+                    with self.sshfs_stream_lock:
+                        reconnected = self.sshfs_manager.reconnect()
+                        if not reconnected:
+                            self.logger.warning(f"SSHFS reconnection not verified on attempt {attempt}")
+                        time.sleep(1.0)
+
+        if not upload_success:
+            self.logger.warning(
+                f"Failed to upload {media_file.source.name} after {max_upload_retries} attempts ({last_error}). "
+                f"Staging local copy to Z: drive for manual transfer (capacity up to 700GB)..."
+            )
+            # Stage on Z drive
+            staged_z_path = self.manual_staging_mgr.stage_file(
+                source_path=media_file.source,
+                output_file=active_output,
+                destination_path=final_path,
+                reason=f"Failed {max_upload_retries} SSHFS upload attempts: {last_error}",
+            )
+
+            # Clean staged source if it exists
+            if staged_source and staged_source.exists():
+                staged_source.unlink(missing_ok=True)
+                with self.staged_lock:
+                    if staged_source in self.staged_files:
+                        self.staged_files.remove(staged_source)
+
+            # Update status in primary migration DB on F: drive
+            self.db.update_status(
+                media_file.source,
+                status="ready_for_manual_transfer",
+                output_path=staged_z_path,
+                source_bytes=media_file.size,
+                output_bytes=out_sz,
+                error=f"Local copy exists at {staged_z_path} and is ready for manual transfer (failed {max_upload_retries} SSHFS upload attempts: {last_error})",
+                worker=worker_type,
+            )
+
+            with self.stats_lock:
+                self.failed_count += 1
+
+            self._update_overall_pbar()
+            worker_pbar.set_description(f"{worker_type} [Idle]")
+            worker_pbar.set_postfix_str(f"Staged to Z: {media_file.source.name[:20]}")
+
+            # Restart connection before continuing to next file
+            with self.sshfs_stream_lock:
+                self.sshfs_manager.reconnect()
+            return
+
+        # Upload was successful: clean local staged files
+        active_output.unlink(missing_ok=True)
         if staged_source and staged_source.exists():
             staged_source.unlink(missing_ok=True)
             with self.staged_lock:
                 if staged_source in self.staged_files:
                     self.staged_files.remove(staged_source)
 
-        # 11. Final validation on remote promoted file
-        if not is_final_valid:
-            self.logger.critical(f"Final validation failed on promoted file {final_path}: {fval_msg}")
-            with self.stats_lock:
-                self.failed_count += 1
-            self.db.update_status(
-                media_file.source,
-                status="failed",
-                output_path=final_path,
-                error=f"Post-promotion validation failed: {fval_msg}",
-                worker=worker_type,
-            )
-            self._update_overall_pbar()
-            return
-
-        # 12. Safely delete remote original if configured
-        final_size = final_path.stat().st_size
+        # 11. Safely delete remote original if configured
+        final_size = final_path.stat().st_size if final_path.exists() else out_sz
         if self.config.processing.delete_original and not self.no_delete:
             if media_file.source.exists() and media_file.source != final_path:
                 try:
@@ -988,7 +1030,7 @@ class MigrationEngine:
                 except Exception as e:
                     self.logger.error(f"Failed to delete original file {media_file.source}: {e}")
 
-        # 13. Mark Completed in DB & update stats
+        # 12. Mark Completed in DB & update stats
         with self.stats_lock:
             self.completed_count += 1
             self.total_source_bytes_processed += media_file.size
