@@ -42,7 +42,7 @@ def setup_logger(
     log_file = log_dir_path / filename
 
     logger = logging.getLogger("av1_migrator")
-    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+    logger.setLevel(logging.DEBUG if verbose else logging.WARNING)
     logger.handlers.clear()
 
     # Rotating file handler
@@ -62,7 +62,7 @@ def setup_logger(
 
     if enable_console:
         tqdm_handler = TqdmLoggingHandler(level=logging.DEBUG if verbose else logging.INFO)
-        tqdm_formatter = logging.Formatter("[%(asctime)s] [%(levelname)-8s] %(message)s", datefmt="%H:%M:%S")
+        tqdm_formatter = logging.Formatter("[%(asctime)s] [%(levelname)] %(message)s", datefmt="%H:%M:%S")
         tqdm_handler.setFormatter(tqdm_formatter)
         logger.addHandler(tqdm_handler)
 

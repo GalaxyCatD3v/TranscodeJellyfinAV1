@@ -2,8 +2,8 @@
 # Safely converts Jellyfin media library over SSHFS to AV1 1080p using NVIDIA NVENC.
 
 media_roots:
-  - "Y:\\srv\\storage\\Movies"
-  - "Y:\\media\\TVShows"
+  - "V:\\srv\\storage\\Movies"
+  - "V:\\media\\TVShows"
 
 extensions:
   - ".mkv"
@@ -27,6 +27,7 @@ output:
   cpu_video_codec: "auto"         # CPU AV1 encoder: "auto" (detects libsvtav1 or libaom-av1), "libsvtav1", "libaom-av1"
   cpu_preset: "6"                 # Preset/speed for CPU encoding (6-8)
   cpu_crf: 28
+
 
 audio:
   languages:
@@ -59,17 +60,17 @@ processing:
   keep_smaller: true
   pre_encode_check: true          # Pre-encode sample analysis to predict space savings & prevent wasted encoding
   sample_duration: 30.0           # Seconds of representative sample clip to test transcode
-  min_savings_percent: 0.0        # Minimum % savings required to transcode (0.0 = must not bloat)
+  min_savings_percent: 0.50        # Minimum % savings required to transcode (0.0 = must not bloat)
   enable_gpu_encoding: true       # Use NVIDIA NVENC GPU encoding
   enable_gpu1: true               # Use GPU 1 NVENC worker
   enable_gpu2: true               # Use GPU 2 NVENC worker
   gpu_workers: 2                  # Total concurrent GPU workers (default: 2)
-  enable_cpu_encoding: true       # Use concurrent CPU AV1 worker alongside GPU
-  resume: true
+  enable_cpu_encoding: false       # Use concurrent CPU AV1 worker alongside GPU
+  resume: false
   scan_cache_hours: 24.0          # Skip remote filesystem scan if last scan was < 24 hours ago
-  network_retries: 3
-  network_retry_delay: 30.0
-  duration_tolerance: 2.0
+  network_retries: 6
+  network_retry_delay: 60.0
+  duration_tolerance: 5.0
 
 video_selection:
   prefer_native_1080p: false
@@ -88,4 +89,4 @@ logging:
   directory: "logs"
   filename: "av1-migrator.log"
   max_bytes: 10485760 # 10 MB
-  backup_count: 5
+  backup_count: 10

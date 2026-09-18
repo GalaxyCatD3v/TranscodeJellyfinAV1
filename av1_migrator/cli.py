@@ -168,6 +168,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable all GPU encoding workers",
     )
+
     parser.add_argument(
         "--gpu-workers",
         type=int,

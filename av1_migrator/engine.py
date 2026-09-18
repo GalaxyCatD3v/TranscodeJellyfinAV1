@@ -948,6 +948,7 @@ class MigrationEngine:
         worker_pbar.set_postfix_str("All tasks complete")
         worker_pbar.finish()
 
+
     def execute(self) -> Dict[str, Any]:
         """
         Executes the migration pipeline:
