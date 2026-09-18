@@ -52,17 +52,17 @@ def setup_logger(
         backupCount=backup_count,
         encoding="utf-8",
     )
-    file_handler.setLevel(logging.DEBUG if verbose else logging.INFO)
+    file_handler.setLevel(logging.DEBUG if verbose else logging.WARNING)
     formatter = logging.Formatter(
-        "[%(asctime)s] [%(levelname)-8s] [%(name)s:%(module)s] %(message)s",
+        "[%(asctime)s] [%(levelname)-s] [%(name)s:%(module)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
     if enable_console:
-        tqdm_handler = TqdmLoggingHandler(level=logging.DEBUG if verbose else logging.INFO)
-        tqdm_formatter = logging.Formatter("[%(asctime)s] [%(levelname)] %(message)s", datefmt="%H:%M:%S")
+        tqdm_handler = TqdmLoggingHandler(level=logging.DEBUG if verbose else logging.WARNING)
+        tqdm_formatter = logging.Formatter("[%(asctime)s] [%(levelname)-8s] %(message)s", datefmt="%H:%M:%S")
         tqdm_handler.setFormatter(tqdm_formatter)
         logger.addHandler(tqdm_handler)
 

@@ -338,3 +338,84 @@ def test_engine_pre_encode_check_skips_bloat(test_env):
         assert db_rec is not None
         assert db_rec["status"] == "skipped"
         assert "predicted bloat" in db_rec["skip_reason"].lower()
+
+
+def test_engine_probe_cache_within_6_hours_skips_remote_scan(test_env):
+    import time
+    config = test_env["config"]
+    config.processing.scan_cache_hours = 6.0
+    db = test_env["db"]
+    m1 = test_env["m1"]
+
+    # Pre-populate db with pending item and recent probe timestamp (1 hour ago)
+    db.upsert_file(
+        source_path=m1,
+        source_size=m1.stat().st_size,
+        source_mtime=m1.stat().st_mtime,
+        status="pending",
+    )
+    db.set_metadata("last_probe_time", str(time.time() - 3600.0))
+
+    def mock_probe(p, cfg):
+        sz = p.stat().st_size
+        return MediaFile(
+            source=p,
+            size=sz,
+            video_codec="hevc",
+            duration=100.0,
+            hdr=False,
+            output_path=p.parent / f"{p.stem} [AV1 1080p SDR CQ28].mkv",
+            temp_output_path=p.parent / f"{p.stem} [AV1 1080p SDR CQ28].mkv.encoding.mkv",
+            selected_video=VideoStream(index=0, codec_name="hevc", width=3840, height=2160),
+            selected_audio=[AudioStream(index=1, codec_name="truehd", language="eng")],
+            status="pending",
+        )
+
+    with patch("av1_migrator.engine.scan_all_roots") as mock_scan, \
+         patch("av1_migrator.engine.probe_and_populate_media_file", side_effect=mock_probe):
+
+        engine = MigrationEngine(config=config, db=db, dry_run=True, no_ui=True)
+        res = engine.execute()
+
+        # scan_all_roots should NOT be called because last probe was 1h ago (< 6h)
+        assert mock_scan.call_count == 0
+        assert res["queue_count"] == 1
+        assert engine.queue[0].source == m1
+
+
+def test_engine_force_scan_bypasses_probe_cache(test_env):
+    import time
+    config = test_env["config"]
+    config.processing.scan_cache_hours = 6.0
+    db = test_env["db"]
+    m1 = test_env["m1"]
+
+    db.upsert_file(
+        source_path=m1,
+        source_size=m1.stat().st_size,
+        source_mtime=m1.stat().st_mtime,
+        status="pending",
+    )
+    db.set_metadata("last_probe_time", str(time.time() - 3600.0))
+
+    def mock_probe(p, cfg):
+        sz = p.stat().st_size
+        return MediaFile(
+            source=p,
+            size=sz,
+            video_codec="hevc",
+            duration=100.0,
+            hdr=False,
+            output_path=p.parent / f"{p.stem} [AV1 1080p SDR CQ28].mkv",
+            temp_output_path=p.parent / f"{p.stem} [AV1 1080p SDR CQ28].mkv.encoding.mkv",
+            selected_video=VideoStream(index=0, codec_name="hevc", width=3840, height=2160),
+            selected_audio=[AudioStream(index=1, codec_name="truehd", language="eng")],
+            status="pending",
+        )
+
+    with patch("av1_migrator.engine.probe_and_populate_media_file", side_effect=mock_probe):
+        engine = MigrationEngine(config=config, db=db, dry_run=True, force_scan=True, no_ui=True)
+        res = engine.execute()
+
+        # Force scan discovers all candidate files across media roots
+        assert res["queue_count"] == 2

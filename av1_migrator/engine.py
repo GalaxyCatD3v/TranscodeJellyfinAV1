@@ -55,6 +55,7 @@ class MigrationEngine:
         retry_failed: bool = False,
         no_delete: bool = False,
         no_ui: bool = False,
+        force_scan: bool = False,
     ):
         self.config = config
         self.db = db or MigrationDB(config.database.path)
@@ -65,6 +66,7 @@ class MigrationEngine:
         self.retry_failed = retry_failed
         self.no_delete = no_delete
         self.no_ui = no_ui
+        self.force_scan = force_scan
 
         self.logger = get_logger()
         self.gpu_monitor = GPUMonitorThread(poll_interval=1.0)
@@ -306,7 +308,29 @@ class MigrationEngine:
             reset_cnt = self.db.reset_failed()
             self.logger.info(f"Reset {reset_cnt} failed/aborted files back to pending")
 
-        if self.single_file:
+        cache_hours = getattr(self.config.processing, "scan_cache_hours", 6.0)
+        last_probe_str = self.db.get_metadata("last_probe_time") or self.db.get_metadata("last_scan_time")
+
+        use_cache = False
+        if not self.single_file and not self.force_scan and last_probe_str and cache_hours > 0:
+            try:
+                last_probe_ts = float(last_probe_str)
+                elapsed_sec = time.time() - last_probe_ts
+                if elapsed_sec < cache_hours * 3600.0:
+                    use_cache = True
+                    elapsed_hrs = elapsed_sec / 3600.0
+                    self.logger.info(
+                        f"Skipping fresh remote scan and probe (last probe was {elapsed_hrs:.1f}h ago, "
+                        f"cache duration: {cache_hours:.1f}h). Loading queue from database..."
+                    )
+            except Exception as e:
+                self.logger.warning(f"Error checking last probe timestamp: {e}")
+
+        if use_cache:
+            pending_rows = self.db.get_pending_files()
+            candidate_paths = [Path(r["source_path"]) for r in pending_rows]
+            scan_stats.files_discovered = len(candidate_paths)
+        elif self.single_file:
             target_path = Path(self.single_file).resolve()
             if not target_path.is_file():
                 raise FileNotFoundError(f"Specified single file not found: {target_path}")
@@ -534,6 +558,9 @@ class MigrationEngine:
 
         try:
             do_probing_loop()
+            if not self.single_file and not use_cache:
+                self.db.set_metadata("last_probe_time", str(time.time()))
+                self.db.set_metadata("last_scan_time", str(time.time()))
         finally:
             try:
                 probe_prog.finish()

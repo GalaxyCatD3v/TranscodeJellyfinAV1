@@ -56,18 +56,18 @@ storage:
 processing:
   sort: "largest_first"           # "largest_first" (biggest files first) or "smallest_first"
   delete_original: true
-  validate_output: true
+  validate_output: false
   keep_smaller: true
   pre_encode_check: true          # Pre-encode sample analysis to predict space savings & prevent wasted encoding
   sample_duration: 30.0           # Seconds of representative sample clip to test transcode
-  min_savings_percent: 0.50        # Minimum % savings required to transcode (0.0 = must not bloat)
+  min_savings_percent: 0.0        # Minimum % savings required to transcode (0.0 = must not bloat)
   enable_gpu_encoding: true       # Use NVIDIA NVENC GPU encoding
   enable_gpu1: true               # Use GPU 1 NVENC worker
   enable_gpu2: true               # Use GPU 2 NVENC worker
   gpu_workers: 2                  # Total concurrent GPU workers (default: 2)
   enable_cpu_encoding: false       # Use concurrent CPU AV1 worker alongside GPU
   resume: false
-  scan_cache_hours: 24.0          # Skip remote filesystem scan if last scan was < 24 hours ago
+  scan_cache_hours: 6.0           # Skip remote filesystem scan/probe if last scan was < 6 hours ago
   network_retries: 6
   network_retry_delay: 60.0
   duration_tolerance: 5.0

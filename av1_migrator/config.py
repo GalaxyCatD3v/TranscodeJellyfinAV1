@@ -140,7 +140,7 @@ class ProcessingConfig:
     enable_cpu_encoding: bool = True
     cpu_max_file_size: Optional[str] = None
     resume: bool = True
-    scan_cache_hours: float = 24.0  # Skip remote filesystem walk if last scan was < 24h ago
+    scan_cache_hours: float = 6.0  # Skip remote filesystem walk/probe if last scan was < 6h ago
     network_retries: int = 3
     network_retry_delay: float = 30.0
     duration_tolerance: float = 2.0  # seconds
@@ -275,7 +275,7 @@ def load_config(config_path: Optional[str | Path] = None) -> AppConfig:
                 enable_cpu_encoding=bool(pr_data.get("enable_cpu_encoding", config.processing.enable_cpu_encoding)),
                 cpu_max_file_size=pr_data.get("cpu_max_file_size", config.processing.cpu_max_file_size),
                 resume=bool(pr_data.get("resume", config.processing.resume)),
-                scan_cache_hours=float(pr_data.get("scan_cache_hours", config.processing.scan_cache_hours)),
+                scan_cache_hours=float(pr_data.get("scan_cache_hours", pr_data.get("probe_cache_hours", config.processing.scan_cache_hours))),
                 network_retries=int(pr_data.get("network_retries", config.processing.network_retries)),
                 network_retry_delay=float(pr_data.get("network_retry_delay", config.processing.network_retry_delay)),
                 duration_tolerance=float(pr_data.get("duration_tolerance", config.processing.duration_tolerance)),

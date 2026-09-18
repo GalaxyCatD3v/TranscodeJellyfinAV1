@@ -8,7 +8,7 @@ import re
 import subprocess
 import threading
 import time
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from av1_migrator.config import AppConfig
 from av1_migrator.logger import get_logger
 from av1_migrator.models import EncodeProgress, MediaFile

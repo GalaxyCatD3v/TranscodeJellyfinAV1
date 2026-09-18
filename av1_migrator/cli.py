@@ -176,15 +176,17 @@ def parse_args() -> argparse.Namespace:
         help="Number of concurrent GPU NVENC workers (default: 2)",
     )
     parser.add_argument(
-        "--force-scan", "--rescan",
+        "--force-scan", "--rescan", "--force-probe",
         action="store_true",
-        help="Force full remote filesystem scan even if last scan was < 24 hours ago",
+        dest="force_scan",
+        help="Force full remote filesystem scan and probe even if last scan was < 6 hours ago",
     )
     parser.add_argument(
-        "--scan-cache-hours",
+        "--scan-cache-hours", "--probe-cache-hours",
         type=float,
         default=None,
-        help="Maximum hours to cache remote scan results before performing fresh scan (default: 24.0)",
+        dest="scan_cache_hours",
+        help="Maximum hours to cache remote scan/probe results before performing fresh scan (default: 6.0)",
     )
     parser.add_argument(
         "--staging-dir",
@@ -308,6 +310,7 @@ def main() -> int:
         retry_failed=args.retry_failed,
         no_delete=args.no_delete,
         no_ui=args.no_ui,
+        force_scan=args.force_scan,
     )
 
     if args.preflight_only:

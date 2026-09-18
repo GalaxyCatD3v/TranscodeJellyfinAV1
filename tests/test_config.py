@@ -57,3 +57,16 @@ processing:
     assert config.processing.pre_encode_check is False
     assert config.processing.sample_duration == 15.0
     assert config.processing.min_savings_percent == 5.0
+
+
+def test_scan_cache_hours_default_and_custom(tmp_path):
+    default_config = load_config()
+    assert default_config.processing.scan_cache_hours == 6.0
+
+    cfg_file = tmp_path / "test_probe_cache.yaml"
+    cfg_file.write_text("""
+processing:
+  probe_cache_hours: 12.0
+""", encoding="utf-8")
+    config = load_config(cfg_file)
+    assert config.processing.scan_cache_hours == 12.0
