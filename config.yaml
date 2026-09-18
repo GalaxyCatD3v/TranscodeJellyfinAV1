@@ -89,6 +89,8 @@ ui:
 database:
   path: "F:\\JellyfinTranscode\\migration.db"
 
+
+
 sshfs:
   enabled: true
   mount_drive: "U:"
@@ -100,6 +102,18 @@ sshfs:
   reconnect_delay: 5.0
   timeout_seconds: 300.0
   manage_connection: true
+
+#sshfs:
+#  enabled: true
+#  mount_drive: "V:"
+#  host: "192.168.1.64"
+#  user: "root"
+#  password: "JasperSpear42$$"
+#  remote_path: "/"
+#  max_retries: 5
+#  reconnect_delay: 5.0
+#  timeout_seconds: 300.0
+#  manage_connection: true
 
 manual_staging:
   enabled: true
